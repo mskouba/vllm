@@ -232,6 +232,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
+    VLLM_DETERMINISTIC_BATCH_PADDING: bool = False
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
@@ -1645,6 +1646,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NIXL EP environment variables
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
+    ),
+    # If set to 1, pad all batches to max_num_batched_tokens before model
+    # execution to reduce floating-point non-determinism from varying cuBLAS
+    # tiling strategies. Most useful for MoE models.
+    "VLLM_DETERMINISTIC_BATCH_PADDING": lambda: bool(
+        int(os.getenv("VLLM_DETERMINISTIC_BATCH_PADDING", "0"))
     ),
 }
 

@@ -127,6 +127,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
+        import vllm.envs as envs
+        self.deterministic_batch_padding = envs.VLLM_DETERMINISTIC_BATCH_PADDING
+        if self.deterministic_batch_padding:
+            logger.info(
+                "Deterministic batch padding enabled: all batches will be "
+                "padded to max_num_batched_tokens=%d", self.max_num_tokens)
+
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.output_copy_stream = torch.cuda.Stream(self.device)
         self.output_copy_event = torch.cuda.Event()
@@ -741,6 +748,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_logits,
         )
 
+        # When deterministic batch padding is enabled, zero out the padding
+        # region of input buffers. This is critical for MoE models: stale
+        # values from previous batches would route padding tokens to different
+        # experts in different runs, changing per-expert matmul dimensions and
+        # reintroducing the non-determinism we're trying to eliminate.
+        if (self.deterministic_batch_padding
+                and num_tokens < num_tokens_after_padding):
+            self.input_buffers.input_ids[
+                num_tokens:num_tokens_after_padding] = 0
+            self.input_buffers.positions[
+                num_tokens:num_tokens_after_padding] = 0
+
         return InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -898,6 +917,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         batch_desc = self.cudagraph_manager.dispatch(
             num_reqs, num_toks, uniform_tok_count
         )
+
+        # When deterministic batch padding is enabled, override the batch
+        # descriptor to always pad to max_num_batched_tokens. This ensures
+        # all linear layers and MoE expert matmuls see identical tensor
+        # dimensions regardless of actual batch composition, eliminating
+        # cuBLAS tiling non-determinism.
+        if self.deterministic_batch_padding:
+            batch_desc = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=self.max_num_tokens,
+                num_reqs=num_reqs,
+            )
+
         num_tokens_across_dp = None
 
         skip_compiled = False
