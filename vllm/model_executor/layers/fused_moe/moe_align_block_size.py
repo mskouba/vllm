@@ -3,9 +3,220 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
+
+
+def _deterministic_sort_expert_tokens(
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    block_size: int,
+    numel: int,
+) -> None:
+    """Sort token indices within each expert group to make ordering
+    deterministic. The CUDA kernel uses atomicAdd to assign positions within
+    each expert's group, which produces non-deterministic ordering. This
+    function sorts each expert's token indices in ascending order so that the
+    same set of tokens always appears in the same order regardless of GPU
+    thread scheduling.
+
+    Args:
+        sorted_ids: Token indices grouped by expert, with padding.
+            Padding tokens have value >= numel.
+        expert_ids: Expert index for each block of block_size tokens.
+        num_tokens_post_pad: Total tokens after padding (scalar tensor).
+        block_size: Block size used for alignment.
+        numel: Total number of real token assignments (num_tokens * top_k).
+    """
+    total = num_tokens_post_pad.item()
+    num_blocks = total // block_size
+
+    # Find expert boundaries using expert_ids on GPU.
+    eid = expert_ids[:num_blocks]
+    # Detect where expert changes: compare adjacent expert_ids.
+    if num_blocks <= 1:
+        # Only one block, sort it directly.
+        if num_blocks == 1:
+            segment = sorted_ids[:block_size]
+            sorted_ids[:block_size] = segment.sort().values
+        return
+
+    changes = (eid[1:] != eid[:-1]).nonzero(as_tuple=True)[0] + 1
+    # boundaries: [0, change1, change2, ..., num_blocks]
+    boundaries = torch.cat([
+        torch.zeros(1, dtype=changes.dtype, device=changes.device),
+        changes,
+        torch.tensor([num_blocks], dtype=changes.dtype, device=changes.device),
+    ])
+    boundaries_cpu = boundaries.cpu()
+
+    sorted_ids_view = sorted_ids[:total]
+    for idx in range(len(boundaries_cpu) - 1):
+        start_block = boundaries_cpu[idx].item()
+        end_block = boundaries_cpu[idx + 1].item()
+        # Skip invalid experts.
+        if expert_ids[start_block].item() == -1:
+            continue
+        start = start_block * block_size
+        end = end_block * block_size
+        # Sort on GPU — this is a small sort per expert group.
+        segment = sorted_ids_view[start:end]
+        sorted_ids_view[start:end] = segment.sort().values
+
+
+def _pad_expert_tokens_to_fixed_size(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: torch.Tensor | None,
+    pad_sorted_ids: bool,
+    ignore_invalid_experts: bool,
+    min_expert_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad each expert's token allocation to at least min_expert_tokens.
+
+    This ensures that per-expert matmul dimensions are more consistent across
+    batches, reducing cuBLAS tiling non-determinism within experts.
+
+    The approach: count tokens per expert, then inflate each expert's count
+    to at least min_expert_tokens before computing the aligned layout.
+
+    We do this by creating synthetic topk_ids entries that route padding tokens
+    to under-represented experts. Then we run the standard moe_align_block_size
+    on the inflated topk_ids.
+    """
+    numel = topk_ids.numel()
+    flat_topk = topk_ids.view(-1)
+
+    # Count tokens per expert.
+    counts = torch.zeros(num_experts, dtype=torch.int32, device=topk_ids.device)
+    for e in range(num_experts):
+        counts[e] = (flat_topk == e).sum()
+
+    # Compute how many padding tokens each expert needs.
+    min_aligned = round_up(min_expert_tokens, block_size)
+    pad_counts = (min_aligned - counts).clamp(min=0)
+    total_pad = pad_counts.sum().item()
+
+    if total_pad == 0:
+        # All experts already have enough tokens, use standard path.
+        return moe_align_block_size(
+            topk_ids, block_size, num_experts,
+            expert_map, pad_sorted_ids, ignore_invalid_experts,
+        )
+
+    # Run the standard kernel, then re-pad each expert group in sorted_ids
+    # to min_aligned.
+    max_num_tokens_padded = numel + num_experts * (min_aligned - 1)
+    if pad_sorted_ids:
+        max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
+
+    # Ensure we have enough space: each expert gets at least min_aligned slots.
+    max_num_tokens_padded = max(max_num_tokens_padded, num_experts * min_aligned)
+
+    sorted_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+    )
+    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+    expert_ids = torch.empty(
+        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+    )
+    num_tokens_post_pad = torch.empty(
+        (1,), dtype=torch.int32, device=topk_ids.device
+    )
+
+    # Run the standard CUDA kernel first.
+    ops.moe_align_block_size(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        expert_map if ignore_invalid_experts else None,
+    )
+
+    # Now re-layout: ensure each expert has at least min_aligned slots.
+    _repad_expert_groups(
+        sorted_ids, expert_ids, num_tokens_post_pad,
+        block_size, num_experts, min_aligned, numel,
+        max_num_tokens_padded,
+    )
+
+    if expert_map is not None and not ignore_invalid_experts:
+        total = num_tokens_post_pad.item()
+        num_blocks_total = total // block_size
+        expert_ids[:num_blocks_total] = expert_map[
+            expert_ids[:num_blocks_total]
+        ]
+
+    return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+def _repad_expert_groups(
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    min_aligned: int,
+    numel: int,
+    max_num_tokens_padded: int,
+) -> None:
+    """Re-layout sorted_ids and expert_ids so each expert gets at least
+    min_aligned token slots. Experts with fewer real tokens get padding
+    (sentinel values = numel) to fill the remaining slots.
+
+    This function also deterministically sorts tokens within each expert
+    group for ordering consistency.
+    """
+    total = num_tokens_post_pad.item()
+    num_blocks = total // block_size
+
+    # Find expert boundaries and gather tokens per expert.
+    # Do this on CPU since we need to rebuild the layout.
+    eid_cpu = expert_ids[:num_blocks].cpu().tolist()
+    sid_cpu = sorted_ids[:total].cpu().tolist()
+
+    # Collect tokens per expert from the kernel output.
+    expert_tokens: list[list[int]] = [[] for _ in range(num_experts)]
+    for i in range(num_blocks):
+        e = eid_cpu[i]
+        if e == -1:
+            continue
+        start = i * block_size
+        end = start + block_size
+        expert_tokens[e].extend(sid_cpu[start:end])
+
+    # Rebuild layout with min_aligned padding per expert.
+    new_sorted: list[int] = []
+    new_expert_ids: list[int] = []
+    for e in range(num_experts):
+        tokens = sorted_ids.new_tensor(expert_tokens[e]).sort().values.tolist()
+        padded_len = max(round_up(len(tokens), block_size), min_aligned)
+        tokens.extend([numel] * (padded_len - len(tokens)))
+        new_sorted.extend(tokens)
+        for _ in range(padded_len // block_size):
+            new_expert_ids.append(e)
+
+    new_total = len(new_sorted)
+    new_num_blocks = len(new_expert_ids)
+
+    # Write back to GPU tensors.
+    sorted_ids[:new_total] = torch.tensor(
+        new_sorted, dtype=torch.int32, device=sorted_ids.device
+    )
+    if new_total < max_num_tokens_padded:
+        sorted_ids[new_total:max_num_tokens_padded] = numel
+    expert_ids[:new_num_blocks] = torch.tensor(
+        new_expert_ids, dtype=torch.int32, device=expert_ids.device
+    )
+    if new_num_blocks < expert_ids.size(0):
+        expert_ids[new_num_blocks:] = -1
+    num_tokens_post_pad.fill_(new_total)
 
 
 def moe_align_block_size(
@@ -71,6 +282,17 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
+    deterministic = envs.VLLM_DETERMINISTIC_BATCH_PADDING
+
+    # Per-expert padding: ensure each expert gets a minimum number of tokens
+    # so that per-expert matmul dimensions are consistent across batches.
+    if deterministic and envs.VLLM_MOE_EXPERT_MIN_TOKENS > 0:
+        return _pad_expert_tokens_to_fixed_size(
+            topk_ids, block_size, num_experts,
+            expert_map, pad_sorted_ids, ignore_invalid_experts,
+            min_expert_tokens=envs.VLLM_MOE_EXPERT_MIN_TOKENS,
+        )
+
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     if pad_sorted_ids:
         max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
@@ -96,6 +318,12 @@ def moe_align_block_size(
         num_tokens_post_pad,
         expert_map if ignore_invalid_experts else None,
     )
+
+    if deterministic:
+        _deterministic_sort_expert_tokens(
+            sorted_ids, expert_ids, num_tokens_post_pad,
+            block_size, topk_ids.numel(),
+        )
 
     if expert_map is not None and not ignore_invalid_experts:
         expert_ids = expert_map[expert_ids]

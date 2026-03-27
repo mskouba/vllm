@@ -233,6 +233,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_DETERMINISTIC_BATCH_PADDING: bool = False
+    VLLM_MOE_EXPERT_MIN_TOKENS: int = 0
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
@@ -1652,6 +1653,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tiling strategies. Most useful for MoE models.
     "VLLM_DETERMINISTIC_BATCH_PADDING": lambda: bool(
         int(os.getenv("VLLM_DETERMINISTIC_BATCH_PADDING", "0"))
+    ),
+    # Minimum number of tokens per expert in MoE routing. When
+    # VLLM_DETERMINISTIC_BATCH_PADDING=1, each expert's token allocation
+    # is padded to at least this many tokens, stabilizing per-expert
+    # matmul dimensions across batches. Set to 0 to disable.
+    "VLLM_MOE_EXPERT_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_MOE_EXPERT_MIN_TOKENS", "0")
     ),
 }
 
