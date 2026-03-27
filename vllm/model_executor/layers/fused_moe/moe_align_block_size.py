@@ -103,7 +103,7 @@ def _pad_expert_tokens_to_fixed_size(
 
     if total_pad == 0:
         # All experts already have enough tokens, use standard path.
-        return moe_align_block_size(
+        return _moe_align_block_size_core(
             topk_ids, block_size, num_experts,
             expert_map, pad_sorted_ids, ignore_invalid_experts,
         )
@@ -219,6 +219,56 @@ def _repad_expert_groups(
     num_tokens_post_pad.fill_(new_total)
 
 
+def _moe_align_block_size_core(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: torch.Tensor | None = None,
+    pad_sorted_ids: bool = False,
+    ignore_invalid_experts: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Core implementation: runs the CUDA kernel and optionally applies
+    deterministic sorting. Does NOT dispatch to per-expert padding."""
+    deterministic = envs.VLLM_DETERMINISTIC_BATCH_PADDING
+
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    if pad_sorted_ids:
+        max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
+    if topk_ids.numel() < num_experts:
+        max_num_tokens_padded = min(
+            topk_ids.numel() * block_size, max_num_tokens_padded
+        )
+    sorted_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+    )
+    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+    expert_ids = torch.empty(
+        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+    )
+    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+
+    ops.moe_align_block_size(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        expert_map if ignore_invalid_experts else None,
+    )
+
+    if deterministic:
+        _deterministic_sort_expert_tokens(
+            sorted_ids, expert_ids, num_tokens_post_pad,
+            block_size, topk_ids.numel(),
+        )
+
+    if expert_map is not None and not ignore_invalid_experts:
+        expert_ids = expert_map[expert_ids]
+
+    return sorted_ids, expert_ids, num_tokens_post_pad
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -282,53 +332,20 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    deterministic = envs.VLLM_DETERMINISTIC_BATCH_PADDING
-
     # Per-expert padding: ensure each expert gets a minimum number of tokens
     # so that per-expert matmul dimensions are consistent across batches.
-    if deterministic and envs.VLLM_MOE_EXPERT_MIN_TOKENS > 0:
+    if (envs.VLLM_DETERMINISTIC_BATCH_PADDING
+            and envs.VLLM_MOE_EXPERT_MIN_TOKENS > 0):
         return _pad_expert_tokens_to_fixed_size(
             topk_ids, block_size, num_experts,
             expert_map, pad_sorted_ids, ignore_invalid_experts,
             min_expert_tokens=envs.VLLM_MOE_EXPERT_MIN_TOKENS,
         )
 
-    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-    if pad_sorted_ids:
-        max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
-    if topk_ids.numel() < num_experts:
-        max_num_tokens_padded = min(
-            topk_ids.numel() * block_size, max_num_tokens_padded
-        )
-    sorted_ids = torch.empty(
-        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+    return _moe_align_block_size_core(
+        topk_ids, block_size, num_experts,
+        expert_map, pad_sorted_ids, ignore_invalid_experts,
     )
-    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
-    expert_ids = torch.empty(
-        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
-    )
-    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-
-    ops.moe_align_block_size(
-        topk_ids,
-        num_experts,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        expert_map if ignore_invalid_experts else None,
-    )
-
-    if deterministic:
-        _deterministic_sort_expert_tokens(
-            sorted_ids, expert_ids, num_tokens_post_pad,
-            block_size, topk_ids.numel(),
-        )
-
-    if expert_map is not None and not ignore_invalid_experts:
-        expert_ids = expert_map[expert_ids]
-
-    return sorted_ids, expert_ids, num_tokens_post_pad
 
 
 def batched_moe_align_block_size(
