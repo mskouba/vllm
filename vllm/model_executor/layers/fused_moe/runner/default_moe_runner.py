@@ -210,6 +210,10 @@ class DefaultMoERunner(MoERunner):
         # Needed for string -> FusedMoE layer lookup in custom ops.
         self.layer_name = layer.layer_name
 
+        # Propagate layer name to router for determinism debug logging.
+        if self.router is not None:
+            self.router._debug_layer_name = self.layer_name
+
         if current_platform.is_tpu() or current_platform.is_cpu():
             # TODO: Once the OOM issue for the TPU backend is resolved, we
             # will switch to using the moe_forward custom op.
@@ -699,6 +703,18 @@ class DefaultMoERunner(MoERunner):
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                     shared_experts_input=shared_input,
+                )
+
+            # Determinism diagnostic logging for MoE layer I/O
+            from vllm.model_executor.layers.fused_moe.determinism_debug import (
+                is_enabled as _det_debug_enabled,
+                log_moe_output,
+            )
+            if _det_debug_enabled():
+                log_moe_output(
+                    layer_name=self.layer_name,
+                    hidden_states_in=hidden_states,
+                    hidden_states_out=final_hidden_states,
                 )
 
             if has_separate_shared_experts:

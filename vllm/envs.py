@@ -246,6 +246,8 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
+    VLLM_MOE_DETERMINISM_DEBUG: bool = False
+    VLLM_MOE_DETERMINISM_DEBUG_PATH: str | None = None
 
 
 def get_default_cache_root():
@@ -1645,6 +1647,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NIXL EP environment variables
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
+    ),
+    # MoE determinism diagnostic logging
+    "VLLM_MOE_DETERMINISM_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_MOE_DETERMINISM_DEBUG", "0"))
+    ),
+    "VLLM_MOE_DETERMINISM_DEBUG_PATH": lambda: os.getenv(
+        "VLLM_MOE_DETERMINISM_DEBUG_PATH", None
     ),
 }
 

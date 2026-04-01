@@ -82,11 +82,24 @@ class Sampler:
         if max_num_logprobs != NO_LOGPROBS:
             if self.logprobs_mode == "processed_logprobs":
                 logits = processed_logits
+
+            # Determinism diagnostic logging
+            from vllm.model_executor.layers.fused_moe.determinism_debug import (
+                is_enabled as _det_debug_enabled,
+                log_tensor_checkpoint as _det_log_checkpoint,
+            )
+            if _det_debug_enabled():
+                _det_log_checkpoint("sampler", "pre_logprob_logits", logits)
+
             expanded_logits = logits.shape[0] != idx_mapping_np.shape[0]
             cu_num_logits = cu_num_logits_np.tolist() if expanded_logits else None
             logprobs_tensors = compute_topk_logprobs(
                 logits, max_num_logprobs, sampled, cu_num_logits
             )
+
+            if _det_debug_enabled() and logprobs_tensors is not None:
+                _det_log_checkpoint("sampler", "logprob_values",
+                                    logprobs_tensors.logprob_values)
         else:
             logprobs_tensors = None
 

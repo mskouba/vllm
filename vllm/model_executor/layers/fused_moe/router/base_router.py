@@ -246,4 +246,18 @@ class BaseRouter(FusedMoERouter):
         # Step 5: Convert indices dtype
         topk_ids = self._convert_indices_dtype(topk_ids, indices_type)
 
+        # Determinism diagnostic logging
+        from vllm.model_executor.layers.fused_moe.determinism_debug import (
+            is_enabled,
+            log_routing_decision,
+        )
+        if is_enabled():
+            log_routing_decision(
+                layer_name=getattr(self, "_debug_layer_name", "unknown"),
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=router_logits,
+                num_tokens=hidden_states.size(0),
+            )
+
         return topk_weights, topk_ids

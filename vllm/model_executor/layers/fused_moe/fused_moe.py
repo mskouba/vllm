@@ -1352,6 +1352,20 @@ def try_get_optimal_moe_config(
         else:
             # Else use the default config
             config = get_default_config(M, E, N, w1_shape[2], top_k, dtype, block_shape)
+
+    from vllm.model_executor.layers.fused_moe.determinism_debug import (
+        is_enabled as _det_debug_enabled,
+        log_kernel_config,
+    )
+    if _det_debug_enabled():
+        E_val, _, N_val = w2_shape
+        source = "override" if override_config else ("tuned" if configs else "default")
+        log_kernel_config(
+            layer_name="try_get_optimal_moe_config",
+            M=M, E=E_val, N=N_val, K=w1_shape[2],
+            config=config, source=source,
+        )
+
     return config
 
 
@@ -1808,6 +1822,27 @@ def fused_experts_impl(
         )
     )
 
+    from vllm.model_executor.layers.fused_moe.determinism_debug import (
+        is_enabled as _det_debug_enabled,
+        log_kernel_config as _det_log_kernel_config,
+        log_tensor_checkpoint as _det_log_checkpoint,
+    )
+    _det_enabled = _det_debug_enabled()
+
+    if _det_enabled:
+        _det_log_kernel_config(
+            layer_name="fused_experts_impl",
+            M=M, E=E, N=N, K=K,
+            config=config,
+            source="naive" if naive_block_assignment else "aligned",
+            extra={
+                "naive_block_assignment": naive_block_assignment,
+                "num_tokens": num_tokens,
+                "top_k_num": top_k_num,
+                "global_num_experts": global_num_experts,
+            },
+        )
+
     if not naive_block_assignment:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids,
@@ -1824,6 +1859,10 @@ def fused_experts_impl(
         )
         num_tokens_post_padded.fill_(max_num_tokens_padded)
         sorted_token_ids = None
+
+    if _det_enabled:
+        _det_log_checkpoint("fused_experts_impl", "input_hidden_states",
+                            qhidden_states)
 
     dispatch_fused_moe_kernel(
         qhidden_states,
@@ -1849,9 +1888,17 @@ def fused_experts_impl(
         B_bias=w1_bias,
     )
 
+    if _det_enabled:
+        _det_log_checkpoint("fused_experts_impl", "after_gate_up_gemm",
+                            intermediate_cache1)
+
     apply_moe_activation(
         activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
     )
+
+    if _det_enabled:
+        _det_log_checkpoint("fused_experts_impl", "after_activation",
+                            intermediate_cache2)
 
     qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
         A=intermediate_cache2,
@@ -1889,10 +1936,18 @@ def fused_experts_impl(
         B_bias=w2_bias,
     )
 
+    if _det_enabled:
+        _det_log_checkpoint("fused_experts_impl", "after_down_gemm",
+                            intermediate_cache3)
+
     ops.moe_sum(
         intermediate_cache3.view(*intermediate_cache3.size()),
         out_hidden_states,
     )
+
+    if _det_enabled:
+        _det_log_checkpoint("fused_experts_impl", "after_moe_sum",
+                            out_hidden_states)
 
     return out_hidden_states
 
