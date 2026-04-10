@@ -439,6 +439,15 @@ def fused_marlin_moe(
         ignore_invalid_experts=True,
     )
 
+    if _MARLIN_MOE_TRACE:
+        _marlin_moe_trace(
+            f"moe_align_block_size RESULT M={M} "
+            f"block_size_m={block_size_m} global_num_experts={global_num_experts}",
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+        )
+
     assert activation is not None
     moe_output = _fused_marlin_moe(
         hidden_states=hidden_states,
