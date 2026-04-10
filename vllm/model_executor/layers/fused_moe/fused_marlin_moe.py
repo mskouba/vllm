@@ -595,6 +595,14 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         return p.is_cuda() and p.has_device_capability((7, 5))
 
     @staticmethod
+    def _supports_batch_invariance() -> bool:
+        # fused_marlin_moe pins block_size_m and the Marlin thread_k/
+        # thread_n/blocks_per_sm under VLLM_BATCH_INVARIANT, bypassing
+        # determine_exec_config's M-dependent scoring in ops.cu. That
+        # makes the Marlin MXFP4/NVFP4/INT4/FP8 MoE path batch-invariant.
+        return True
+
+    @staticmethod
     def _supports_no_act_and_mul() -> bool:
         return True
 
