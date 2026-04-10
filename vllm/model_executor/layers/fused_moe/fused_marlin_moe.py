@@ -7,6 +7,7 @@ from collections.abc import Callable
 import torch
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -115,6 +116,19 @@ def _fused_marlin_moe(
 
     intermediate_cache2 = _resize_cache(intermediate_cache2, (M * num_topk, N))
 
+    if envs.VLLM_BATCH_INVARIANT:
+        # Pin thread config so determine_exec_config is bypassed
+        # and the M-dependent thread-tile scoring does not change
+        # the accumulation order across batch sizes. The bypass is enabled
+        # inside ops.cu whenever thread_k != -1 && thread_n != -1.
+        bi_thread_k = 128
+        bi_thread_n = 64
+        bi_blocks_per_sm = 1
+    else:
+        bi_thread_k = -1
+        bi_thread_n = -1
+        bi_blocks_per_sm = -1
+
     a_scales1 = None
     gate_up_input = hidden_states
     if input_dtype == torch.int8:
@@ -151,6 +165,9 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
+        thread_k=bi_thread_k,
+        thread_n=bi_thread_n,
+        blocks_per_sm=bi_blocks_per_sm,
     )
     activation_func(
         activation,
@@ -203,6 +220,9 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
+        thread_k=bi_thread_k,
+        thread_n=bi_thread_n,
+        blocks_per_sm=bi_blocks_per_sm,
     )
 
     return output
@@ -305,11 +325,18 @@ def fused_marlin_moe(
     assert num_bits in [4, 8]
     assert topk_weights.dtype == torch.float32
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
+    if envs.VLLM_BATCH_INVARIANT:
+        # Under batch invariance, pin block_size_m so the tiling is
+        # independent of M. Mirrors the fixed BLOCK_SIZE_M=64 used by the
+        # Triton fused MoE path in fused_moe.py::get_default_config when
+        # VLLM_BATCH_INVARIANT is set.
+        block_size_m = 64
+    else:
+        # M block size selection logic
+        # TODO: tune this further for specific models
+        for block_size_m in [8, 16, 32, 48, 64]:
+            if M * topk / E / block_size_m < 0.9:
+                break
 
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
