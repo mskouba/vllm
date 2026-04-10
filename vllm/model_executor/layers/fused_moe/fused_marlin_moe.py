@@ -39,6 +39,40 @@ def _marlin_moe_fp(t: torch.Tensor | None) -> str:
     )
 
 
+def _marlin_moe_halves_match(t: torch.Tensor | None) -> str:
+    """For same-content BS=2 diagnostics: split row dim in half and test
+    bitwise equality. Returns a short string used in trace lines.
+
+    If ``t`` has an even number of rows, compares ``t[:M//2]`` against
+    ``t[M//2:]``. Prints either ``halves=EQUAL`` or the largest abs diff
+    and the first diverging row index. Otherwise returns ``halves=odd``.
+    """
+    if t is None:
+        return "halves=None"
+    if t.dim() == 0 or t.size(0) < 2 or (t.size(0) % 2) != 0:
+        return f"halves=odd(M={0 if t.dim() == 0 else t.size(0)})"
+    half = t.size(0) // 2
+    a = t[:half]
+    b = t[half:]
+    if a.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        diff = (a.to(torch.float64) - b.to(torch.float64)).abs()
+        max_diff = float(diff.max().item())
+        if max_diff == 0.0:
+            return f"halves=EQUAL(M/2={half})"
+        # First row where any element differs
+        row_has_diff = (diff > 0).any(dim=tuple(range(1, diff.dim()))) \
+            if diff.dim() > 1 else (diff > 0)
+        first_bad = int(row_has_diff.nonzero(as_tuple=False)[0].item())
+        return (
+            f"halves=DIFF(M/2={half}) max_abs_diff={max_diff:.6e} "
+            f"first_bad_row={first_bad}"
+        )
+    else:
+        # Integer / index tensors: exact equality
+        equal = bool((a == b).all().item())
+        return f"halves={'EQUAL' if equal else 'DIFF'}(int,M/2={half})"
+
+
 def _marlin_moe_trace(tag: str, **tensors: torch.Tensor | None) -> None:
     if not _MARLIN_MOE_TRACE:
         return
@@ -47,6 +81,11 @@ def _marlin_moe_trace(tag: str, **tensors: torch.Tensor | None) -> None:
     parts = [f"[MARLIN-MOE-TRACE #{_MARLIN_MOE_TRACE_COUNTER} {tag}]"]
     for name, t in tensors.items():
         parts.append(f"  {name}: {_marlin_moe_fp(t)}")
+        # Extra diagnostic: are the two halves of the row dim equal?
+        # Only meaningful for the BS=2 same-content test but harmless
+        # elsewhere.
+        if t is not None and t.dim() >= 1:
+            parts.append(f"    {_marlin_moe_halves_match(t)}")
     print("\n".join(parts), file=sys.stderr, flush=True)
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
