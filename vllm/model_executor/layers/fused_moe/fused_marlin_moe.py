@@ -6,9 +6,48 @@ from collections.abc import Callable
 
 import torch
 
+import os
+import sys
+
 import vllm._custom_ops as ops
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+
+_MARLIN_MOE_TRACE = os.environ.get("VLLM_MARLIN_MOE_TRACE", "0") == "1"
+_MARLIN_MOE_TRACE_COUNTER = 0
+
+
+def _marlin_moe_fp(t: torch.Tensor | None) -> str:
+    """Stable, cheap fingerprint of a tensor for cross-run comparison.
+
+    Casts to float32 on device, computes (sum, sum_of_squares, min, max)
+    with deterministic reduction, and returns a short string. Intended
+    only for tracing under VLLM_MARLIN_MOE_TRACE=1.
+    """
+    if t is None:
+        return "None"
+    if t.numel() == 0:
+        return f"empty[{tuple(t.shape)}]"
+    x = t.detach().to(torch.float64)
+    s = float(x.sum().item())
+    ss = float((x * x).sum().item())
+    mn = float(x.min().item())
+    mx = float(x.max().item())
+    return (
+        f"shape={tuple(t.shape)} dtype={t.dtype} "
+        f"sum={s:+.12e} sumsq={ss:.12e} min={mn:+.6e} max={mx:+.6e}"
+    )
+
+
+def _marlin_moe_trace(tag: str, **tensors: torch.Tensor | None) -> None:
+    if not _MARLIN_MOE_TRACE:
+        return
+    global _MARLIN_MOE_TRACE_COUNTER
+    _MARLIN_MOE_TRACE_COUNTER += 1
+    parts = [f"[MARLIN-MOE-TRACE #{_MARLIN_MOE_TRACE_COUNTER} {tag}]"]
+    for name, t in tensors.items():
+        parts.append(f"  {name}: {_marlin_moe_fp(t)}")
+    print("\n".join(parts), file=sys.stderr, flush=True)
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -315,6 +354,16 @@ def fused_marlin_moe(
     E = w1.size(0)
     topk = topk_ids.size(1)
 
+    if _MARLIN_MOE_TRACE:
+        _marlin_moe_trace(
+            f"fused_marlin_moe ENTRY M={M} K={K} E={E} topk={topk} "
+            f"BI={envs.VLLM_BATCH_INVARIANT}",
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            w1_ptr=torch.tensor([w1.data_ptr()], dtype=torch.int64),
+        )
+
     # Check constraints.
     assert w1.size(1) * 16 == K, "Hidden size mismatch w1"
     assert w2.size(2) // (num_bits // 2) == K, "Hidden size mismatch w2"
@@ -393,9 +442,17 @@ def fused_marlin_moe(
         output = hidden_states if inplace else torch.empty_like(hidden_states)
 
     if moe_sum is None:
-        return torch.sum(moe_output.view(-1, topk, K), dim=1, out=output)
+        result = torch.sum(moe_output.view(-1, topk, K), dim=1, out=output)
     else:
-        return moe_sum(moe_output, output)
+        result = moe_sum(moe_output, output)
+
+    if _MARLIN_MOE_TRACE:
+        _marlin_moe_trace(
+            f"fused_marlin_moe EXIT M={M} K={K}",
+            moe_output=moe_output,
+            result=result,
+        )
+    return result
 
 
 def batched_fused_marlin_moe(
