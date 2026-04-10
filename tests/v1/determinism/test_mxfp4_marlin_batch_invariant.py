@@ -143,6 +143,36 @@ def test_mxfp4_marlin_moe_same_content_batch(backend):
         lp0, _ = _extract_step_logprobs(pair[0])
         lp1, _ = _extract_step_logprobs(pair[1])
 
+        # Per-index diff dump before the hard assert so we can see exactly
+        # which decode step first diverges and by how much.
+        diff01 = (lp0 - lp1).abs()
+        print(
+            "\n[same-content intra-batch] per-step abs(lp0 - lp1):",
+            flush=True,
+        )
+        for i in range(lp0.numel()):
+            print(
+                f"  step {i:2d}: lp0={lp0[i].item():+.9f} "
+                f"lp1={lp1[i].item():+.9f} "
+                f"abs_diff={diff01[i].item():.6e} "
+                f"{'MATCH' if diff01[i].item() == 0.0 else 'DIFF'}",
+                flush=True,
+            )
+
+        diff0b = (lp0 - lp_base).abs()
+        print(
+            "\n[same-content cross-batch vs BS=1] per-step abs(lp0 - lp_base):",
+            flush=True,
+        )
+        for i in range(lp0.numel()):
+            print(
+                f"  step {i:2d}: lp0={lp0[i].item():+.9f} "
+                f"lp_base={lp_base[i].item():+.9f} "
+                f"abs_diff={diff0b[i].item():.6e} "
+                f"{'MATCH' if diff0b[i].item() == 0.0 else 'DIFF'}",
+                flush=True,
+            )
+
         # (1) intra-batch invariance
         assert pair[0].outputs[0].token_ids == pair[1].outputs[0].token_ids, (
             "intra-batch token ids differ for identical prompts"
