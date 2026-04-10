@@ -492,13 +492,15 @@ def fused_marlin_moe(
     if moe_sum is None:
         result = torch.sum(moe_output.view(-1, topk, K), dim=1, out=output)
     else:
+        # NOTE: `moe_sum` writes into `output` in-place and returns None,
+        # so the real post-reduction tensor is `output`, not `result`.
         result = moe_sum(moe_output, output)
 
     if _MARLIN_MOE_TRACE:
         _marlin_moe_trace(
             f"fused_marlin_moe EXIT M={M} K={K}",
             moe_output=moe_output,
-            result=result,
+            output=output,
         )
     return result
 
