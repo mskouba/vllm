@@ -50,21 +50,48 @@ def force_marlin_mxfp4_backend(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_MXFP4_USE_MARLIN", "1")
 
 
-def _get_first_moe_block(llm: LLM):
-    """Drill into the loaded LLM and return the first transformer layer's
-    MoE block (the ``mlp`` attribute, which contains ``router`` and
-    ``experts``). gpt-oss is all-MoE so layer 0 always has experts.
+def _marlin_moe_unit_probe(model) -> dict:
+    """Run inside the worker via ``LLMEngine.apply_model``.
+
+    Drills into ``model`` to find the first transformer layer's MoE
+    block, then calls it twice — once with M=1 and once with M=8 where
+    the M=8 input shares row 0 with the M=1 input — and returns a
+    summary dict of the row-0 bitwise comparison.
     """
-    # vLLM v1 path: engine -> executor -> driver_worker -> model_runner -> model
-    engine = llm.llm_engine
-    executor = engine.model_executor
-    driver_worker = executor.driver_worker
-    model_runner = driver_worker.model_runner
-    model = model_runner.model
-    # gpt-oss model wraps an inner ``model`` with ``layers``.
+    import torch as _torch  # local import; this fn runs in the worker
+
     inner = getattr(model, "model", model)
-    layers = inner.layers
-    return layers[0].mlp
+    mlp = inner.layers[0].mlp
+
+    device = next(mlp.parameters()).device
+    dtype = mlp.experts.params_dtype if hasattr(mlp.experts, "params_dtype") else None
+    if dtype is None:
+        # Fall back to whichever dtype the router weight uses; experts
+        # weights are quantized so their dtype is uint8/int4 and not what
+        # we want for the activation tensor.
+        dtype = mlp.router.weight.dtype
+    K = mlp.hidden_size
+
+    _torch.manual_seed(20240919)
+    hs_full = _torch.randn(8, K, device=device, dtype=dtype)
+    hs_1 = hs_full[0:1].clone()
+    hs_N = hs_full.clone()
+    assert _torch.equal(hs_1[0], hs_N[0])
+
+    with _torch.inference_mode():
+        out_1 = mlp(hs_1)
+        out_N = mlp(hs_N)
+
+    row0_1 = out_1[0, :K].float()
+    row0_N = out_N[0, :K].float()
+    diff = (row0_1 - row0_N).abs()
+    return {
+        "max_abs": float(diff.max().item()),
+        "max_idx": int(diff.argmax().item()),
+        "n_within_1e_5": int((diff < 1e-5).sum().item()),
+        "n_total": int(diff.numel()),
+        "bitwise_equal": bool(_torch.equal(row0_1, row0_N)),
+    }
 
 
 @skip_unsupported
@@ -72,65 +99,45 @@ def _get_first_moe_block(llm: LLM):
 def test_mxfp4_marlin_moe_unit_invariance(backend):
     """Direct unit-level invariance probe for ``fused_marlin_moe``.
 
-    This bypasses every engine confound (KV cache, scheduler, sampler,
-    chunked prefill, batch composition). It loads the LLM only to obtain
-    a real Marlin MXFP4 MoE layer with real weights, then calls that
-    layer's ``forward`` directly with two synthetic ``hidden_states``
-    tensors that share row 0 by construction:
+    Bypasses every engine confound (KV cache, scheduler, sampler,
+    chunked prefill, batch composition). Loads the LLM only to obtain a
+    real Marlin MXFP4 MoE layer with real weights, then drives the
+    layer's ``forward`` directly inside the worker process with two
+    synthetic ``hidden_states`` tensors that share row 0 by
+    construction:
 
       hs_1: shape [1, K]
       hs_N: shape [N, K], hs_N[0] == hs_1[0]
 
-    If row 0 of the M=1 output equals row 0 of the M=N output bitwise,
-    ``fused_marlin_moe`` is itself batch-invariant and the residual
-    drift seen in the engine-level test must come from somewhere else
-    (router input drift, attention KV-cache decode geometry, etc).
-
-    If row 0 differs, the bug is intrinsic to the Marlin MoE path and
-    we keep digging there.
+    Outcomes:
+      - row 0 bitwise-equal → ``fused_marlin_moe`` is itself
+        batch-invariant; the engine-level drift comes from upstream
+        (attention KV-cache decode, router input drift, etc).
+      - row 0 differs → the bug is intrinsic to the Marlin MoE path
+        and we keep digging there.
     """
     llm = None
     try:
         llm = _make_llm(max_num_seqs=8, backend=backend)
-        mlp = _get_first_moe_block(llm)
-        device = next(mlp.parameters()).device
-        dtype = next(mlp.parameters()).dtype
-        K = mlp.hidden_size
-        # Use a deterministic synthetic hidden state. Row 0 is the row we
-        # care about; rows 1..N-1 are filler with different content so
-        # the routing decisions differ across rows (which exercises the
-        # heterogeneous-batch path).
-        torch.manual_seed(20240919)
-        hs_full = torch.randn(8, K, device=device, dtype=dtype)
-        hs_1 = hs_full[0:1].clone()
-        hs_N = hs_full.clone()
-        assert torch.equal(hs_1[0], hs_N[0])
-
-        with torch.inference_mode():
-            out_1 = mlp(hs_1)
-            out_N = mlp(hs_N)
-
-        # Strip the router padding (gpt-oss returns hidden_size width).
-        row0_1 = out_1[0, :K]
-        row0_N = out_N[0, :K]
-
-        diff = (row0_1 - row0_N).abs()
-        max_abs = float(diff.max().item())
-        max_idx = int(diff.argmax().item())
-        n_close = int((diff < 1e-5).sum().item())
-        n_total = int(diff.numel())
+        # ``apply_model`` runs the probe inside the worker process and
+        # returns a list (one entry per worker).
+        results = llm.llm_engine.apply_model(_marlin_moe_unit_probe)
+        result = results[0]
         print(
-            f"[unit] M=1 vs M=8 row-0 diff: max_abs={max_abs:.4e} "
-            f"at hidden_idx={max_idx} elements_within_1e-5={n_close}/{n_total}",
+            f"[unit] M=1 vs M=8 row-0 diff: "
+            f"max_abs={result['max_abs']:.4e} "
+            f"at hidden_idx={result['max_idx']} "
+            f"elements_within_1e-5={result['n_within_1e_5']}/{result['n_total']} "
+            f"bitwise_equal={result['bitwise_equal']}",
             flush=True,
         )
-
-        assert torch.equal(row0_1, row0_N), (
+        assert result["bitwise_equal"], (
             f"fused_marlin_moe not batch-invariant for row 0: "
-            f"max_abs_diff={max_abs:.4e} at hidden_idx={max_idx}, "
-            f"only {n_close}/{n_total} elements within 1e-5. "
-            f"This isolates the residual drift to the Marlin MoE path "
-            f"itself (not engine-side)."
+            f"max_abs_diff={result['max_abs']:.4e} at "
+            f"hidden_idx={result['max_idx']}, only "
+            f"{result['n_within_1e_5']}/{result['n_total']} elements "
+            f"within 1e-5. This isolates the residual drift to the "
+            f"Marlin MoE path itself (not engine-side)."
         )
     finally:
         if llm is not None:
