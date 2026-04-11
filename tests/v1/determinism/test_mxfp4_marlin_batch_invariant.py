@@ -48,6 +48,11 @@ def force_marlin_mxfp4_backend(monkeypatch: pytest.MonkeyPatch):
     """
     monkeypatch.setattr(envs, "VLLM_MXFP4_USE_MARLIN", True)
     monkeypatch.setenv("VLLM_MXFP4_USE_MARLIN", "1")
+    # ``test_mxfp4_marlin_moe_unit_invariance`` ships a probe function
+    # to the worker via ``LLMEngine.apply_model``. vLLM's default
+    # msgpack RPC cannot serialize Python callables, so opt into the
+    # pickle fallback for this test module.
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
 
 def _marlin_moe_unit_probe(model) -> dict:
