@@ -182,6 +182,214 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
     )
 
 
+def _install_bisect_hooks(worker) -> None:
+    """Install per-sub-module forward hooks on every transformer block.
+
+    For each TransformerBlock we hook ``input_layernorm``, ``attn``,
+    ``post_attention_layernorm``, and ``mlp`` separately so we can pin
+    the divergence to a single sub-step within a layer (input norm vs.
+    attention vs. post norm vs. MoE). We also hook the embedding and the
+    final ``norm`` for completeness.
+
+    Captures *only* forward calls whose primary output has shape
+    ``[2, hidden]`` — that uniquely identifies the same-content BS=2
+    decode steps and skips prefill (which has shape [2*L, hidden]).
+    """
+    model = worker.model_runner.model
+    inner = getattr(model, "model", model)
+    layers = inner.layers
+
+    worker._bisect_storage = {}
+    storage = worker._bisect_storage
+
+    def _primary(tensor_or_tuple):
+        if isinstance(tensor_or_tuple, tuple):
+            for t in tensor_or_tuple:
+                if hasattr(t, "shape"):
+                    return t
+            return None
+        return tensor_or_tuple
+
+    def make_hook(name):
+        def hook(_module, _inputs, output):
+            try:
+                out = _primary(output)
+                if out is None or out.dim() != 2 or out.shape[0] != 2:
+                    return
+                storage.setdefault(name, []).append(out.detach().clone())
+            except Exception:
+                pass
+
+        return hook
+
+    handles = []
+    if hasattr(inner, "embedding"):
+        handles.append(inner.embedding.register_forward_hook(make_hook("embedding")))
+    for i, layer in enumerate(layers):
+        for sub in ("input_layernorm", "attn", "post_attention_layernorm", "mlp"):
+            mod = getattr(layer, sub, None)
+            if mod is not None:
+                handles.append(
+                    mod.register_forward_hook(make_hook(f"layer_{i:02d}.{sub}"))
+                )
+    if hasattr(inner, "norm"):
+        handles.append(inner.norm.register_forward_hook(make_hook("final_norm")))
+    worker._bisect_handles = handles
+
+
+def _collect_bisect_results(worker) -> dict:
+    """Compute per-step row0 vs row1 diff for each hooked sub-module."""
+    storage = getattr(worker, "_bisect_storage", {})
+    out: dict[str, list[dict]] = {}
+    for name, tensors in storage.items():
+        per_step = []
+        for t in tensors:
+            d = (t[0].float() - t[1].float()).abs()
+            max_v = float(d.max().item())
+            arg = int(d.argmax().item())
+            per_step.append(
+                {
+                    "max": max_v,
+                    "argmax": arg,
+                    "bitwise_eq": max_v == 0.0,
+                }
+            )
+        out[name] = per_step
+    for h in getattr(worker, "_bisect_handles", []):
+        h.remove()
+    worker._bisect_handles = []
+    worker._bisect_storage = {}
+    return out
+
+
+@skip_unsupported
+@pytest.mark.parametrize("backend", ["TRITON_ATTN"])
+def test_mxfp4_marlin_moe_layer_bisect_same_content_bs2(backend):
+    """Per-sub-module bisect of same-content BS=2 greedy decode.
+
+    Marlin MoE has been independently proven invariant by the unit-level
+    test. The remaining drift on gpt-oss-20b must originate upstream of
+    the MoE block. This test installs forward hooks on every
+    sub-module of every transformer block, runs a same-content BS=2
+    greedy generation, and reports — per decode step — the first
+    sub-module whose output for row 0 differs from row 1.
+
+    The first divergence point is the offending sub-module. Suspects on
+    gpt-oss specifically are: attention sinks, alternating SWA, the
+    pre/post-attention RMSNorms with residual fusion.
+    """
+    sampling = SamplingParams(
+        temperature=0.0,
+        top_p=1.0,
+        top_k=-1,
+        max_tokens=8,
+        logprobs=5,
+    )
+    needle_prompt = "Write one factual sentence about the moon."
+    llm = None
+    try:
+        llm = _make_llm(max_num_seqs=8, backend=backend)
+        llm.llm_engine.collective_rpc(_install_bisect_hooks)
+
+        # Run a same-content BS=2 greedy generation. Decode steps will be
+        # forward calls with [2, hidden] inputs/outputs (one token per
+        # sequence per step) — the hooks select exactly those.
+        llm.generate([needle_prompt, needle_prompt], sampling, use_tqdm=False)
+
+        results = llm.llm_engine.collective_rpc(_collect_bisect_results)[0]
+
+        # Assemble per-step view: for each captured decode step index,
+        # walk sub-modules in topological order and find the first one
+        # whose row0 != row1.
+        # We assume all sub-modules captured the same number of steps;
+        # take the min to be safe.
+        ordered_names = []
+        if "embedding" in results:
+            ordered_names.append("embedding")
+        # layers in numeric order
+        layer_keys = sorted(
+            k for k in results if k.startswith("layer_") and "." in k
+        )
+        # within each layer, fixed sub-order:
+        sub_order = ["input_layernorm", "attn", "post_attention_layernorm", "mlp"]
+        layer_indices = sorted(
+            {int(k.split("_")[1].split(".")[0]) for k in layer_keys}
+        )
+        for li in layer_indices:
+            for sub in sub_order:
+                key = f"layer_{li:02d}.{sub}"
+                if key in results:
+                    ordered_names.append(key)
+        if "final_norm" in results:
+            ordered_names.append("final_norm")
+
+        if not ordered_names:
+            pytest.fail(
+                "no [2, hidden] sub-module outputs captured — model "
+                "structure may differ from gpt-oss; check hook filters."
+            )
+
+        n_steps = min(len(results[n]) for n in ordered_names)
+        print(
+            f"\n[bisect] captured {n_steps} decode step(s) across "
+            f"{len(ordered_names)} sub-modules",
+            flush=True,
+        )
+
+        first_div_per_step: list[tuple[int, str | None, float]] = []
+        for step in range(n_steps):
+            first_div: str | None = None
+            first_max = 0.0
+            for name in ordered_names:
+                entry = results[name][step]
+                if not entry["bitwise_eq"]:
+                    first_div = name
+                    first_max = entry["max"]
+                    break
+            first_div_per_step.append((step, first_div, first_max))
+            if first_div is None:
+                print(f"  step {step:2d}: all sub-modules bitwise-equal", flush=True)
+            else:
+                print(
+                    f"  step {step:2d}: first divergence at "
+                    f"{first_div} max_abs={first_max:.4e}",
+                    flush=True,
+                )
+
+        # Find the earliest step that diverges and dump the full
+        # sub-module ladder for it so we can see whether the residual
+        # path also drifts (input_layernorm sees the residual fused in).
+        first_bad = next(
+            (s for s, d, _ in first_div_per_step if d is not None), None
+        )
+        if first_bad is not None:
+            print(
+                f"\n[bisect] full ladder for earliest divergent step "
+                f"{first_bad}:",
+                flush=True,
+            )
+            for name in ordered_names:
+                entry = results[name][first_bad]
+                tag = "EQ " if entry["bitwise_eq"] else "DIFF"
+                print(
+                    f"  {tag} {name}: max={entry['max']:.4e} "
+                    f"argmax={entry['argmax']}",
+                    flush=True,
+                )
+
+        # This test is diagnostic — it should *fail* (and dump the
+        # ladder) until the upstream divergence is fixed. Once fixed,
+        # this is also the regression guard.
+        assert first_bad is None, (
+            f"row 0 vs row 1 diverges at decode step {first_bad}; "
+            f"see ladder above for the offending sub-module."
+        )
+    finally:
+        if llm is not None:
+            with contextlib.suppress(Exception):
+                llm.shutdown()
+
+
 @skip_unsupported
 @pytest.mark.parametrize("backend", ["TRITON_ATTN"])
 def test_mxfp4_marlin_moe_same_content_batch_greedy(backend):
