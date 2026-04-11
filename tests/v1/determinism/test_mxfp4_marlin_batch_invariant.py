@@ -55,24 +55,26 @@ def force_marlin_mxfp4_backend(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
 
-def _marlin_moe_unit_probe(model) -> dict:
-    """Run inside the worker via ``LLMEngine.apply_model``.
+def _marlin_moe_unit_probe(worker) -> dict:
+    """Run inside the worker via ``collective_rpc``.
 
-    Drills into ``model`` to find the first transformer layer's MoE
-    block, then calls it twice — once with M=1 and once with M=8 where
-    the M=8 input shares row 0 with the M=1 input — and returns a
-    summary dict of the row-0 bitwise comparison.
+    ``collective_rpc(callable)`` calls ``callable(worker)`` on each
+    worker (see ``vllm.v1.serial_utils.run_method``). The worker exposes
+    ``model_runner``, from which we get both the live model and the
+    real ``vllm_config`` — needed by ``set_forward_context``.
 
-    The MoE block does not perform attention, so a stub forward context
-    with ``attn_metadata=None`` is sufficient. We need the context only
-    so the MoE/router code paths that read ``get_forward_context()``
-    don't crash.
+    Drills into the first transformer layer's MoE block, then calls it
+    twice — once with M=1 and once with M=8 where the M=8 input shares
+    row 0 with the M=1 input — and returns a summary dict of the row-0
+    bitwise comparison.
     """
     import torch as _torch  # local imports; this runs in the worker
 
-    from vllm.config import get_current_vllm_config
     from vllm.forward_context import set_forward_context
 
+    model_runner = worker.model_runner
+    vllm_config = model_runner.vllm_config
+    model = model_runner.model
     inner = getattr(model, "model", model)
     mlp = inner.layers[0].mlp
 
@@ -87,8 +89,6 @@ def _marlin_moe_unit_probe(model) -> dict:
     hs_1 = hs_full[0:1].clone()
     hs_N = hs_full.clone()
     assert _torch.equal(hs_1[0], hs_N[0])
-
-    vllm_config = get_current_vllm_config()
 
     def _run(hs):
         with set_forward_context(
@@ -139,9 +139,10 @@ def test_mxfp4_marlin_moe_unit_invariance(backend):
     llm = None
     try:
         llm = _make_llm(max_num_seqs=8, backend=backend)
-        # ``apply_model`` runs the probe inside the worker process and
-        # returns a list (one entry per worker).
-        results = llm.llm_engine.apply_model(_marlin_moe_unit_probe)
+        # ``collective_rpc(callable)`` calls ``callable(worker)`` on
+        # each worker. We need worker access (not just the model) so the
+        # probe can read ``vllm_config`` from the model_runner.
+        results = llm.llm_engine.collective_rpc(_marlin_moe_unit_probe)
         result = results[0]
         print(
             f"[unit] M=1 vs M=8 row-0 diff: "
