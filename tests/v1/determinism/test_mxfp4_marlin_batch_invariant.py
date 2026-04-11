@@ -68,6 +68,69 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
 
 @skip_unsupported
 @pytest.mark.parametrize("backend", ["TRITON_ATTN"])
+def test_mxfp4_marlin_moe_same_content_batch_greedy(backend):
+    """Same-content BS=2 with GREEDY decoding (no RNG, no top-p/top-k).
+
+    Removes all sampling nondeterminism:
+      temperature=0 -> argmax
+      top_p=1.0, top_k=-1 -> no filtering
+      no seed dependency
+
+    If this still fails intra-batch, the divergence is 100% in the
+    model forward pass (or lm_head / RMSNorm). If this passes while
+    the non-greedy same-content test fails, the bug is in vLLM's
+    sampler or logprob extraction, not in the Marlin MoE path.
+    """
+    sampling = SamplingParams(
+        temperature=0.0,
+        top_p=1.0,
+        top_k=-1,
+        max_tokens=8,
+        logprobs=5,
+    )
+    needle_prompt = "Write one factual sentence about the moon."
+    llm = None
+    try:
+        llm = _make_llm(max_num_seqs=8, backend=backend)
+        base = llm.generate([needle_prompt], sampling, use_tqdm=False)[0]
+        lp_base, _ = _extract_step_logprobs(base)
+
+        pair = llm.generate(
+            [needle_prompt, needle_prompt], sampling, use_tqdm=False
+        )
+        lp0, _ = _extract_step_logprobs(pair[0])
+        lp1, _ = _extract_step_logprobs(pair[1])
+
+        print("\n[greedy same-content intra-batch] per-step:", flush=True)
+        for i in range(lp0.numel()):
+            d = abs(lp0[i].item() - lp1[i].item())
+            print(
+                f"  step {i:2d}: lp0={lp0[i].item():+.9f} "
+                f"lp1={lp1[i].item():+.9f} abs_diff={d:.6e} "
+                f"{'MATCH' if d == 0.0 else 'DIFF'}",
+                flush=True,
+            )
+        print("\n[greedy same-content cross-batch vs BS=1] per-step:", flush=True)
+        for i in range(lp0.numel()):
+            d = abs(lp0[i].item() - lp_base[i].item())
+            print(
+                f"  step {i:2d}: lp0={lp0[i].item():+.9f} "
+                f"lp_base={lp_base[i].item():+.9f} abs_diff={d:.6e} "
+                f"{'MATCH' if d == 0.0 else 'DIFF'}",
+                flush=True,
+            )
+
+        assert pair[0].outputs[0].token_ids == pair[1].outputs[0].token_ids
+        torch.testing.assert_close(lp0, lp1, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(lp0, lp_base, rtol=0.0, atol=0.0)
+    finally:
+        if llm is not None:
+            with contextlib.suppress(Exception):
+                llm.shutdown()
+
+
+@skip_unsupported
+@pytest.mark.parametrize("backend", ["TRITON_ATTN"])
 def test_mxfp4_marlin_moe_bs1_self_consistency(backend):
     """BS=1 run twice — should be bitwise identical to itself.
 
