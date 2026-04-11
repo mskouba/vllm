@@ -50,6 +50,94 @@ def force_marlin_mxfp4_backend(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_MXFP4_USE_MARLIN", "1")
 
 
+def _get_first_moe_block(llm: LLM):
+    """Drill into the loaded LLM and return the first transformer layer's
+    MoE block (the ``mlp`` attribute, which contains ``router`` and
+    ``experts``). gpt-oss is all-MoE so layer 0 always has experts.
+    """
+    # vLLM v1 path: engine -> executor -> driver_worker -> model_runner -> model
+    engine = llm.llm_engine
+    executor = engine.model_executor
+    driver_worker = executor.driver_worker
+    model_runner = driver_worker.model_runner
+    model = model_runner.model
+    # gpt-oss model wraps an inner ``model`` with ``layers``.
+    inner = getattr(model, "model", model)
+    layers = inner.layers
+    return layers[0].mlp
+
+
+@skip_unsupported
+@pytest.mark.parametrize("backend", ["TRITON_ATTN"])
+def test_mxfp4_marlin_moe_unit_invariance(backend):
+    """Direct unit-level invariance probe for ``fused_marlin_moe``.
+
+    This bypasses every engine confound (KV cache, scheduler, sampler,
+    chunked prefill, batch composition). It loads the LLM only to obtain
+    a real Marlin MXFP4 MoE layer with real weights, then calls that
+    layer's ``forward`` directly with two synthetic ``hidden_states``
+    tensors that share row 0 by construction:
+
+      hs_1: shape [1, K]
+      hs_N: shape [N, K], hs_N[0] == hs_1[0]
+
+    If row 0 of the M=1 output equals row 0 of the M=N output bitwise,
+    ``fused_marlin_moe`` is itself batch-invariant and the residual
+    drift seen in the engine-level test must come from somewhere else
+    (router input drift, attention KV-cache decode geometry, etc).
+
+    If row 0 differs, the bug is intrinsic to the Marlin MoE path and
+    we keep digging there.
+    """
+    llm = None
+    try:
+        llm = _make_llm(max_num_seqs=8, backend=backend)
+        mlp = _get_first_moe_block(llm)
+        device = next(mlp.parameters()).device
+        dtype = next(mlp.parameters()).dtype
+        K = mlp.hidden_size
+        # Use a deterministic synthetic hidden state. Row 0 is the row we
+        # care about; rows 1..N-1 are filler with different content so
+        # the routing decisions differ across rows (which exercises the
+        # heterogeneous-batch path).
+        torch.manual_seed(20240919)
+        hs_full = torch.randn(8, K, device=device, dtype=dtype)
+        hs_1 = hs_full[0:1].clone()
+        hs_N = hs_full.clone()
+        assert torch.equal(hs_1[0], hs_N[0])
+
+        with torch.inference_mode():
+            out_1 = mlp(hs_1)
+            out_N = mlp(hs_N)
+
+        # Strip the router padding (gpt-oss returns hidden_size width).
+        row0_1 = out_1[0, :K]
+        row0_N = out_N[0, :K]
+
+        diff = (row0_1 - row0_N).abs()
+        max_abs = float(diff.max().item())
+        max_idx = int(diff.argmax().item())
+        n_close = int((diff < 1e-5).sum().item())
+        n_total = int(diff.numel())
+        print(
+            f"[unit] M=1 vs M=8 row-0 diff: max_abs={max_abs:.4e} "
+            f"at hidden_idx={max_idx} elements_within_1e-5={n_close}/{n_total}",
+            flush=True,
+        )
+
+        assert torch.equal(row0_1, row0_N), (
+            f"fused_marlin_moe not batch-invariant for row 0: "
+            f"max_abs_diff={max_abs:.4e} at hidden_idx={max_idx}, "
+            f"only {n_close}/{n_total} elements within 1e-5. "
+            f"This isolates the residual drift to the Marlin MoE path "
+            f"itself (not engine-side)."
+        )
+    finally:
+        if llm is not None:
+            with contextlib.suppress(Exception):
+                llm.shutdown()
+
+
 def _make_llm(max_num_seqs: int, backend: str) -> LLM:
     return LLM(
         model=MXFP4_MOE_MODEL,
