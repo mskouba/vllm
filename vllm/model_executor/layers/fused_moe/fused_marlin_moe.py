@@ -73,6 +73,35 @@ def _marlin_moe_halves_match(t: torch.Tensor | None) -> str:
         return f"halves={'EQUAL' if equal else 'DIFF'}(int,M/2={half})"
 
 
+def _marlin_moe_rows_eq(t: torch.Tensor | None, max_rows: int = 16) -> str:
+    """Per-row pairwise equality probe for small M (decode case).
+
+    For tensors with M <= ``max_rows``, fingerprints each row independently
+    and reports which rows are bitwise equal to row 0. This catches
+    intra-batch position-dependent divergence at decode time, where the
+    halves-split probe is meaningless because M is tiny (e.g. M=2 for
+    BS=2 decode).
+    """
+    if t is None or t.dim() == 0:
+        return "rows=N/A"
+    M = t.size(0)
+    if M < 2 or M > max_rows:
+        return f"rows=skip(M={M})"
+    if t.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        eqs = [bool((t[i] == t[0]).all().item()) for i in range(M)]
+        return "rows=" + "".join("E" if e else "D" for e in eqs)
+    x = t.detach().to(torch.float64)
+    eqs: list[bool] = []
+    diffs: list[float] = []
+    for i in range(M):
+        d = float((x[i] - x[0]).abs().max().item())
+        eqs.append(d == 0.0)
+        diffs.append(d)
+    glyphs = "".join("E" if e else "D" for e in eqs)
+    worst = max(diffs)
+    return f"rows={glyphs} max_row_vs_row0_diff={worst:.6e}"
+
+
 def _marlin_moe_trace(tag: str, **tensors: torch.Tensor | None) -> None:
     if not _MARLIN_MOE_TRACE:
         return
@@ -86,6 +115,7 @@ def _marlin_moe_trace(tag: str, **tensors: torch.Tensor | None) -> None:
         # elsewhere.
         if t is not None and t.dim() >= 1:
             parts.append(f"    {_marlin_moe_halves_match(t)}")
+            parts.append(f"    {_marlin_moe_rows_eq(t)}")
     print("\n".join(parts), file=sys.stderr, flush=True)
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
