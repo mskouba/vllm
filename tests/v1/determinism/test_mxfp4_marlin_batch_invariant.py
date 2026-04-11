@@ -62,19 +62,24 @@ def _marlin_moe_unit_probe(model) -> dict:
     block, then calls it twice — once with M=1 and once with M=8 where
     the M=8 input shares row 0 with the M=1 input — and returns a
     summary dict of the row-0 bitwise comparison.
+
+    The MoE block does not perform attention, so a stub forward context
+    with ``attn_metadata=None`` is sufficient. We need the context only
+    so the MoE/router code paths that read ``get_forward_context()``
+    don't crash.
     """
-    import torch as _torch  # local import; this fn runs in the worker
+    import torch as _torch  # local imports; this runs in the worker
+
+    from vllm.config import get_current_vllm_config
+    from vllm.forward_context import set_forward_context
 
     inner = getattr(model, "model", model)
     mlp = inner.layers[0].mlp
 
     device = next(mlp.parameters()).device
-    dtype = mlp.experts.params_dtype if hasattr(mlp.experts, "params_dtype") else None
-    if dtype is None:
-        # Fall back to whichever dtype the router weight uses; experts
-        # weights are quantized so their dtype is uint8/int4 and not what
-        # we want for the activation tensor.
-        dtype = mlp.router.weight.dtype
+    # The router's weight dtype is the activation dtype we want; the
+    # quantized expert weights are uint8/int4 and not usable here.
+    dtype = mlp.router.weight.dtype
     K = mlp.hidden_size
 
     _torch.manual_seed(20240919)
@@ -83,9 +88,19 @@ def _marlin_moe_unit_probe(model) -> dict:
     hs_N = hs_full.clone()
     assert _torch.equal(hs_1[0], hs_N[0])
 
+    vllm_config = get_current_vllm_config()
+
+    def _run(hs):
+        with set_forward_context(
+            attn_metadata=None,
+            vllm_config=vllm_config,
+            num_tokens=hs.shape[0],
+        ):
+            return mlp(hs)
+
     with _torch.inference_mode():
-        out_1 = mlp(hs_1)
-        out_N = mlp(hs_N)
+        out_1 = _run(hs_1)
+        out_N = _run(hs_N)
 
     row0_1 = out_1[0, :K].float()
     row0_N = out_N[0, :K].float()
