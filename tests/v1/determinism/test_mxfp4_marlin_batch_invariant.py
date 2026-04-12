@@ -151,12 +151,25 @@ def _marlin_moe_unit_probe_m2(worker) -> dict:
 
     _torch.manual_seed(20240919)
     row = _torch.randn(K, device=device, dtype=dtype)
+    other_row = _torch.randn(K, device=device, dtype=dtype)
+    # Sanity: the two rows really are different — otherwise the
+    # "different-row" check below collapses into the identical-row case.
+    assert not _torch.equal(row, other_row)
 
-    hs_1 = row.unsqueeze(0).clone()                  # [1, K]
-    hs_2 = _torch.stack([row, row], dim=0).clone()   # [2, K], both rows equal
+    hs_1 = row.unsqueeze(0).clone()                          # [1, K]
+    hs_2 = _torch.stack([row, row], dim=0).clone()           # [2, K] equal rows
     hs_2_dup = _torch.stack([row, row], dim=0).clone()
+    # The decode-time case the engine actually hits: M=2 with TWO
+    # DIFFERENT rows. row 0 is the seq we care about; row 1 is "the
+    # other sequence in the batch". If Marlin's behavior on row 0
+    # depends on what row 1 contains (e.g. via routing-induced
+    # changes in sorted_token_ids ordering, per-expert padding, or
+    # thread_k boundary handling), this is the case that exposes it.
+    hs_2_diff = _torch.stack([row, other_row], dim=0).clone()
     assert _torch.equal(hs_1[0], hs_2[0])
     assert _torch.equal(hs_2[0], hs_2[1])
+    assert _torch.equal(hs_2_diff[0], hs_1[0])
+    assert not _torch.equal(hs_2_diff[0], hs_2_diff[1])
 
     def _run(hs):
         with set_forward_context(
@@ -170,6 +183,7 @@ def _marlin_moe_unit_probe_m2(worker) -> dict:
         out_1 = _run(hs_1)
         out_2 = _run(hs_2)
         out_2b = _run(hs_2_dup)
+        out_2_diff = _run(hs_2_diff)
 
     # Slice to hidden size — gpt-oss MoE returns [..., hidden + extras]
     # in some configurations; the original probe does the same.
@@ -177,6 +191,7 @@ def _marlin_moe_unit_probe_m2(worker) -> dict:
     o2_r0 = out_2[0, :K].float()
     o2_r1 = out_2[1, :K].float()
     o2b_r0 = out_2b[0, :K].float()
+    o2d_r0 = out_2_diff[0, :K].float()
 
     def _summarize(a, b):
         d = (a - b).abs()
@@ -190,6 +205,10 @@ def _marlin_moe_unit_probe_m2(worker) -> dict:
         "m1_vs_m2_row0": _summarize(o1_r0, o2_r0),
         "m2_row0_vs_row1": _summarize(o2_r0, o2_r1),
         "m2_self_consistency_row0": _summarize(o2_r0, o2b_r0),
+        # The decode-realistic case: row 0 is the seq we care about,
+        # row 1 is a different sequence's hidden state. Compare row 0
+        # of M=2-with-different-row1 to M=1 with the same row.
+        "m1_vs_m2_diff_row1": _summarize(o1_r0, o2d_r0),
     }
 
 
