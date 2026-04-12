@@ -229,8 +229,14 @@ def _fused_marlin_moe(
         # and the M-dependent thread-tile scoring does not change
         # the accumulation order across batch sizes. The bypass is enabled
         # inside ops.cu whenever thread_k != -1 && thread_n != -1.
-        bi_thread_k = 128
-        bi_thread_n = 64
+        #
+        # Valid configs from THREAD_CONFIGS:
+        #   (128, 128), (64, 256), (64, 128), (128, 64)
+        # Override via env vars for experimentation:
+        bi_thread_k = int(os.environ.get(
+            "VLLM_MARLIN_MOE_BI_THREAD_K", "128"))
+        bi_thread_n = int(os.environ.get(
+            "VLLM_MARLIN_MOE_BI_THREAD_N", "64"))
         bi_blocks_per_sm = 1
     else:
         bi_thread_k = -1
