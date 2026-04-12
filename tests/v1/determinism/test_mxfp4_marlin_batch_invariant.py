@@ -212,6 +212,118 @@ def _marlin_moe_unit_probe_m2(worker) -> dict:
     }
 
 
+def _marlin_moe_all_layers_probe(worker) -> list[dict]:
+    """Run the M=2 heterogeneous-row unit probe on EVERY MoE layer.
+
+    Returns a list of per-layer summaries. Each entry contains the
+    layer index and the m1_vs_m2_diff_row1 comparison (the
+    decode-realistic case that the crossrun bisect flagged).
+    """
+    import torch as _torch
+
+    from vllm.forward_context import set_forward_context
+
+    model_runner = worker.model_runner
+    vllm_config = model_runner.vllm_config
+    model = model_runner.model
+    inner = getattr(model, "model", model)
+
+    results = []
+    for layer_idx, layer in enumerate(inner.layers):
+        mlp = layer.mlp
+        device = next(mlp.parameters()).device
+        dtype = mlp.router.weight.dtype
+        K = mlp.hidden_size
+
+        _torch.manual_seed(20240919)
+        row = _torch.randn(K, device=device, dtype=dtype)
+        other_row = _torch.randn(K, device=device, dtype=dtype)
+
+        hs_1 = row.unsqueeze(0).clone()
+        hs_2_diff = _torch.stack([row, other_row], dim=0).clone()
+
+        def _run(hs):
+            with set_forward_context(
+                attn_metadata=None,
+                vllm_config=vllm_config,
+                num_tokens=hs.shape[0],
+            ):
+                return mlp(hs)
+
+        with _torch.inference_mode():
+            out_1 = _run(hs_1)
+            out_2 = _run(hs_2_diff)
+
+        o1_r0 = out_1[0, :K].float()
+        o2_r0 = out_2[0, :K].float()
+        d = (o1_r0 - o2_r0).abs()
+
+        results.append(
+            {
+                "layer": layer_idx,
+                "bitwise_equal": bool(_torch.equal(o1_r0, o2_r0)),
+                "max_abs": float(d.max().item()),
+                "argmax": int(d.argmax().item()),
+            }
+        )
+
+    return results
+
+
+@skip_unsupported
+@pytest.mark.parametrize("backend", ["TRITON_ATTN"])
+def test_mxfp4_marlin_moe_all_layers_m2_invariance(backend):
+    """Scan every MoE layer for M=2 heterogeneous-row invariance.
+
+    The crossrun bisect showed that ``layer_03.mlp`` and
+    ``layer_15.mlp`` diverge between BS=1 and BS=2 while
+    ``layer_00.mlp`` (used by the original unit test) does not. This
+    test drives the M=2 different-row probe across ALL layers to find
+    the complete set of layers whose Marlin MoE output is
+    batch-dependent.
+    """
+    llm = None
+    try:
+        llm = _make_llm(max_num_seqs=8, backend=backend)
+        results = llm.llm_engine.collective_rpc(
+            _marlin_moe_all_layers_probe
+        )
+        layer_results = results[0]
+
+        failing = []
+        print(
+            f"\n[all-layers M=2] scanning {len(layer_results)} MoE layers:",
+            flush=True,
+        )
+        for entry in layer_results:
+            tag = "EQ  " if entry["bitwise_equal"] else "DIFF"
+            print(
+                f"  layer {entry['layer']:2d}: {tag} "
+                f"max_abs={entry['max_abs']:.4e} "
+                f"argmax={entry['argmax']}",
+                flush=True,
+            )
+            if not entry["bitwise_equal"]:
+                failing.append(entry["layer"])
+
+        print(
+            f"\n[all-layers M=2] failing layers: "
+            f"{failing if failing else 'none'}",
+            flush=True,
+        )
+
+        assert not failing, (
+            f"M=2 heterogeneous-row invariance failed at "
+            f"{len(failing)}/{len(layer_results)} layers: {failing}. "
+            f"The Marlin MoE kernel produces different row 0 output "
+            f"depending on what row 1 contains at these layers."
+        )
+    finally:
+        if llm is not None:
+            with contextlib.suppress(Exception):
+                llm.shutdown()
+
+
 @skip_unsupported
 @pytest.mark.parametrize("backend", ["TRITON_ATTN"])
 def test_mxfp4_marlin_moe_unit_invariance_m2(backend):
