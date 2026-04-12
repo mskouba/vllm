@@ -522,6 +522,11 @@ def test_mxfp4_marlin_moe_same_content_batch_greedy(backend):
         lp0, _ = _extract_step_logprobs(pair[0])
         lp1, _ = _extract_step_logprobs(pair[1])
 
+
+        print("First response Token Ids: ",pair[0].outputs[0].token_ids)
+        print("Second response Token Ids: ",pair[1].outputs[0].token_ids)
+
+
         print("\n[greedy same-content intra-batch] per-step:", flush=True)
         for i in range(lp0.numel()):
             d = abs(lp0[i].item() - lp1[i].item())
