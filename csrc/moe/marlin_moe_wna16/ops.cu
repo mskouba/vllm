@@ -695,7 +695,7 @@ torch::Tensor moe_wna16_marlin_gemm(
         (long)size_n * sorted_token_ids.size(0),
         (long)sms * 4 * moe_block_size * MARLIN_NAMESPACE_NAME::max_thread_n);
     if (moe_block_size == 8) max_c_tmp_size *= 2;
-    c_tmp = torch::empty({max_c_tmp_size}, options_fp32);
+    c_tmp = torch::zeros({max_c_tmp_size}, options_fp32);
   } else {
     c_tmp = torch::empty({0}, options_fp32);
   }
