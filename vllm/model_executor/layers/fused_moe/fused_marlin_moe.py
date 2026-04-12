@@ -238,10 +238,12 @@ def _fused_marlin_moe(
         bi_thread_n = int(os.environ.get(
             "VLLM_MARLIN_MOE_BI_THREAD_N", "64"))
         bi_blocks_per_sm = 1
+        bi_use_fp32_reduce = False
     else:
         bi_thread_k = -1
         bi_thread_n = -1
         bi_blocks_per_sm = -1
+        bi_use_fp32_reduce = True
 
     a_scales1 = None
     gate_up_input = hidden_states
@@ -277,7 +279,7 @@ def _fused_marlin_moe(
         size_k=K,
         is_k_full=is_k_full,
         use_atomic_add=False,
-        use_fp32_reduce=True,
+        use_fp32_reduce=bi_use_fp32_reduce,
         is_zp_float=False,
         thread_k=bi_thread_k,
         thread_n=bi_thread_n,
@@ -332,7 +334,7 @@ def _fused_marlin_moe(
         size_k=N,
         is_k_full=is_k_full,
         use_atomic_add=False,
-        use_fp32_reduce=True,
+        use_fp32_reduce=bi_use_fp32_reduce,
         is_zp_float=False,
         thread_k=bi_thread_k,
         thread_n=bi_thread_n,
