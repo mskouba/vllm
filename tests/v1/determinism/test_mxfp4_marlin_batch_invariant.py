@@ -222,9 +222,30 @@ def _install_bisect_hooks(worker) -> None:
 
         return hook
 
+    # Separate storage for embedding *inputs* — i.e. the actual token
+    # IDs being looked up. This disambiguates "rows differ because the
+    # tokens are genuinely different (scheduling/misalignment artifact)"
+    # from "rows differ even though tokens are the same (real bug)".
+    worker._bisect_embed_inputs = []
+    embed_inputs = worker._bisect_embed_inputs
+
+    def embedding_hook(_module, inputs, output):
+        try:
+            out = _primary(output)
+            if out is None or out.dim() != 2 or out.shape[0] != 2:
+                return
+            storage.setdefault("embedding", []).append(out.detach().clone())
+            # inputs is a tuple; first positional is input_ids
+            if inputs and hasattr(inputs[0], "shape"):
+                embed_inputs.append(inputs[0].detach().clone())
+            else:
+                embed_inputs.append(None)
+        except Exception:
+            pass
+
     handles = []
     if hasattr(inner, "embedding"):
-        handles.append(inner.embedding.register_forward_hook(make_hook("embedding")))
+        handles.append(inner.embedding.register_forward_hook(embedding_hook))
     for i, layer in enumerate(layers):
         for sub in ("input_layernorm", "attn", "post_attention_layernorm", "mlp"):
             mod = getattr(layer, sub, None)
@@ -255,10 +276,26 @@ def _collect_bisect_results(worker) -> dict:
                 }
             )
         out[name] = per_step
+    # Surface the captured embedding input_ids alongside the per-layer
+    # diff so the test can print actual token IDs at row 0 / row 1 of
+    # each [2, hidden] forward.
+    embed_inputs = getattr(worker, "_bisect_embed_inputs", [])
+    embed_input_dump = []
+    for t in embed_inputs:
+        if t is None:
+            embed_input_dump.append(None)
+        else:
+            try:
+                embed_input_dump.append(t.detach().cpu().tolist())
+            except Exception:
+                embed_input_dump.append(None)
+    out["__embed_input_ids__"] = embed_input_dump  # type: ignore[assignment]
+
     for h in getattr(worker, "_bisect_handles", []):
         h.remove()
     worker._bisect_handles = []
     worker._bisect_storage = {}
+    worker._bisect_embed_inputs = []
     return out
 
 
@@ -298,6 +335,11 @@ def test_mxfp4_marlin_moe_layer_bisect_same_content_bs2(backend):
 
         results = llm.llm_engine.collective_rpc(_collect_bisect_results)[0]
 
+        # Pull out the embedding input_ids dump (token IDs that were
+        # actually looked up at each captured [2, hidden] forward) so we
+        # can print row 0 / row 1 token IDs alongside the bisect.
+        embed_input_ids = results.pop("__embed_input_ids__", [])
+
         # Assemble per-step view: for each captured decode step index,
         # walk sub-modules in topological order and find the first one
         # whose row0 != row1.
@@ -335,6 +377,28 @@ def test_mxfp4_marlin_moe_layer_bisect_same_content_bs2(backend):
             f"{len(ordered_names)} sub-modules",
             flush=True,
         )
+
+        # Dump the actual token IDs at row 0 / row 1 for each captured
+        # forward. If row0 != row1, the [2, hidden] forward is NOT a
+        # clean same-content decode batch — it's a scheduling artifact
+        # (e.g. mixed prefill+decode, or two seqs at different decode
+        # offsets) and the bisect's "embedding diverges" reading is not
+        # a real numerical bug.
+        print("[bisect] embedding input_ids per captured forward:", flush=True)
+        for i, ids in enumerate(embed_input_ids):
+            if ids is None:
+                print(f"  step {i:2d}: <unavailable>", flush=True)
+                continue
+            if len(ids) >= 2:
+                row0 = ids[0]
+                row1 = ids[1]
+                tag = "SAME" if row0 == row1 else "DIFF"
+                print(
+                    f"  step {i:2d}: row0_id={row0} row1_id={row1} {tag}",
+                    flush=True,
+                )
+            else:
+                print(f"  step {i:2d}: ids={ids}", flush=True)
 
         first_div_per_step: list[tuple[int, str | None, float]] = []
         for step in range(n_steps):
