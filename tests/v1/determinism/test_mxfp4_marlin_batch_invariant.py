@@ -212,6 +212,102 @@ def _marlin_moe_unit_probe_m2(worker) -> dict:
     }
 
 
+def _marlin_moe_routing_probe(worker) -> dict:
+    """Dump routing pattern + expert overlap for one layer at M=2.
+
+    Runs the MoE at M=1 (row only) and M=2 (row + other_row), captures
+    the topk_ids from the router for each, and reports:
+      - which experts row 0 and row 1 are routed to
+      - how many experts they share (the overlap)
+      - whether the output is bitwise equal
+
+    Then runs a SWEEP of random other_rows to see if the failure rate
+    correlates with expert overlap count.
+    """
+    import torch as _torch
+
+    from vllm.forward_context import set_forward_context
+
+    model_runner = worker.model_runner
+    vllm_config = model_runner.vllm_config
+    model = model_runner.model
+    inner = getattr(model, "model", model)
+
+    # Test every layer, but only report details for failing ones.
+    # Use the layer that failed with random inputs (layer 23).
+    target_layers = list(range(len(inner.layers)))
+
+    results = {}
+    for layer_idx in target_layers:
+        mlp = inner.layers[layer_idx].mlp
+        device = next(mlp.parameters()).device
+        dtype = mlp.router.weight.dtype
+        K = mlp.hidden_size
+        topk = mlp.experts_per_token
+
+        # Fixed row for all trials.
+        _torch.manual_seed(20240919)
+        row = _torch.randn(K, device=device, dtype=dtype)
+
+        # Run M=1 baseline.
+        hs_1 = row.unsqueeze(0).clone()
+
+        def _run(hs):
+            with set_forward_context(
+                attn_metadata=None,
+                vllm_config=vllm_config,
+                num_tokens=hs.shape[0],
+            ):
+                return mlp(hs)
+
+        with _torch.inference_mode():
+            out_1 = _run(hs_1)
+            o1_r0 = out_1[0, :K].float()
+
+            # Get row 0's routing by calling router directly.
+            router_out_1 = mlp.router(hs_1)
+            if isinstance(router_out_1, tuple):
+                router_out_1 = router_out_1[0]
+            topk_1 = _torch.topk(router_out_1[0], topk).indices.tolist()
+
+        # Sweep 10 random other_rows to see how overlap correlates
+        # with divergence.
+        sweep = []
+        for seed in range(10):
+            _torch.manual_seed(seed * 7 + 42)
+            other_row = _torch.randn(K, device=device, dtype=dtype)
+            hs_2 = _torch.stack([row, other_row], dim=0).clone()
+
+            with _torch.inference_mode():
+                out_2 = _run(hs_2)
+                o2_r0 = out_2[0, :K].float()
+
+                router_out_2 = mlp.router(hs_2)
+                if isinstance(router_out_2, tuple):
+                    router_out_2 = router_out_2[0]
+                topk_r1 = _torch.topk(router_out_2[1], topk).indices.tolist()
+
+            d = (o1_r0 - o2_r0).abs()
+            overlap = len(set(topk_1) & set(topk_r1))
+            sweep.append({
+                "seed": seed,
+                "row0_experts": topk_1,
+                "row1_experts": topk_r1,
+                "overlap": overlap,
+                "bitwise_eq": bool(_torch.equal(o1_r0, o2_r0)),
+                "max_abs": float(d.max().item()),
+            })
+
+        n_fail = sum(1 for s in sweep if not s["bitwise_eq"])
+        if n_fail > 0:
+            results[layer_idx] = {
+                "row0_experts": topk_1,
+                "sweep": sweep,
+            }
+
+    return results
+
+
 def _marlin_moe_all_layers_probe(worker) -> list[dict]:
     """Run the M=2 heterogeneous-row unit probe on EVERY MoE layer.
 
@@ -268,6 +364,62 @@ def _marlin_moe_all_layers_probe(worker) -> list[dict]:
         )
 
     return results
+
+
+@skip_unsupported
+@pytest.mark.parametrize("backend", ["TRITON_ATTN"])
+def test_mxfp4_marlin_moe_routing_overlap_probe(backend):
+    """Probe expert-overlap vs divergence correlation.
+
+    For each layer that fails the M=2 different-row check, sweeps 10
+    random other_rows and reports the expert overlap count alongside
+    the bitwise equality. If failures only occur when overlap > 0,
+    the bug is specifically in shared-expert block processing.
+    """
+    llm = None
+    try:
+        llm = _make_llm(max_num_seqs=8, backend=backend)
+        results = llm.llm_engine.collective_rpc(
+            _marlin_moe_routing_probe
+        )
+        probe = results[0]
+
+        if not probe:
+            print("[routing probe] no layers failed — all 10 seeds "
+                  "pass at every layer.", flush=True)
+            return
+
+        for layer_idx, data in sorted(probe.items()):
+            print(f"\n[routing probe] layer {layer_idx}:", flush=True)
+            print(f"  row0 experts: {data['row0_experts']}", flush=True)
+            for s in data["sweep"]:
+                tag = "EQ  " if s["bitwise_eq"] else "DIFF"
+                print(
+                    f"  seed={s['seed']:2d} {tag} "
+                    f"overlap={s['overlap']} "
+                    f"row1_experts={s['row1_experts']} "
+                    f"max_abs={s['max_abs']:.4e}",
+                    flush=True,
+                )
+
+            # Summarize: is overlap correlated with failure?
+            fails_with_overlap = sum(
+                1 for s in data["sweep"]
+                if not s["bitwise_eq"] and s["overlap"] > 0
+            )
+            fails_without_overlap = sum(
+                1 for s in data["sweep"]
+                if not s["bitwise_eq"] and s["overlap"] == 0
+            )
+            print(
+                f"  summary: fails_with_overlap={fails_with_overlap} "
+                f"fails_without_overlap={fails_without_overlap}",
+                flush=True,
+            )
+    finally:
+        if llm is not None:
+            with contextlib.suppress(Exception):
+                llm.shutdown()
 
 
 @skip_unsupported
