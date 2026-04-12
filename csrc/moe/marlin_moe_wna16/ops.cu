@@ -345,7 +345,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
-               bool use_fp32_reduce, bool is_zp_float) {
+               bool use_fp32_reduce, bool is_zp_float,
+               bool no_k_split = false) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -526,7 +527,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
-      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
+      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce,
+      no_k_split);
   // clang-format on
 }
 
@@ -854,24 +856,12 @@ torch::Tensor moe_wna16_marlin_gemm(
   }
 
   // Under batch-invariance (indicated by an explicit thread config via
-  // thread_k/thread_n), override sms so that gridDim.x (= sms * blocks_per_sm)
-  // is at least global_mn_tiles.  This forces the kernel into pure
-  // data-parallel mode (no Stream-K K-splitting), so every output tile is
-  // handled entirely by one threadblock — no c_tmp reduction, and therefore
-  // bitwise-identical results regardless of M.
-  int launch_sms = sms;
-  if (thread_k > 0 && thread_n > 0) {
-    int thread_n_blocks = thread_n / 16;
-    int parallel =
-        (int)(sorted_token_ids.size(0) / moe_block_size);  // num MoE blocks
-    int n_tiles = size_n / (16 * thread_n_blocks);
-    int global_mn_tiles = parallel * n_tiles;
-    int bps = blocks_per_sm > 0 ? blocks_per_sm : 1;
-    int needed_sms = (global_mn_tiles + bps - 1) / bps;
-    if (needed_sms > launch_sms) {
-      launch_sms = needed_sms;
-    }
-  }
+  // thread_k/thread_n), disable Stream-K work partitioning so each output
+  // tile is processed entirely by one threadblock (pure DP).  This avoids
+  // K-splitting across blocks, which would route partial sums through the
+  // c_tmp reduction buffer whose slot assignment depends on the total tile
+  // count (and therefore on M), breaking bitwise batch invariance.
+  bool no_k_split = (thread_k > 0 && thread_n > 0);
 
   MARLIN_NAMESPACE_NAME::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),
@@ -883,8 +873,8 @@ torch::Tensor moe_wna16_marlin_gemm(
       mul_topk_weights, size_m, size_n, size_k, workspace.data_ptr(), a_type,
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
-      thread_k, thread_n, launch_sms, blocks_per_sm, use_atomic_add,
-      use_fp32_reduce, is_zp_float);
+      thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
+      is_zp_float, no_k_split);
 
   return c;
 }

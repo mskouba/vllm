@@ -405,6 +405,15 @@ __global__ void Marlin(
 
   int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
 
+  // Under batch-invariance (no_k_split), force each block to handle all
+  // K-slices for its tile.  This prevents Stream-K from splitting the
+  // K-dimension across blocks, which would route partial sums through the
+  // c_tmp reduction buffer whose slot mapping depends on the total tile
+  // count (and therefore on M), breaking bitwise batch invariance.
+  if (no_k_split && iters < k_tiles) {
+    iters = k_tiles;
+  }
+
   if constexpr (!has_act_order && group_blocks != -1) {
     if (group_blocks >= thread_k_blocks) {
       // Ensure that the number of tiles in each stripe is a multiple of the
