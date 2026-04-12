@@ -222,20 +222,26 @@ def _install_bisect_hooks(worker) -> None:
 
         return hook
 
-    # Separate storage for embedding *inputs* — i.e. the actual token
-    # IDs being looked up. This disambiguates "rows differ because the
-    # tokens are genuinely different (scheduling/misalignment artifact)"
-    # from "rows differ even though tokens are the same (real bug)".
+    # Capture EVERY embedding forward unconditionally so we can see the
+    # full schedule (prefill chunk shapes, decode batch shapes, mixed
+    # batches, etc.) rather than guessing what shape filter to use. The
+    # earlier shape==[2, hidden] filter was producing misleading
+    # captures: all dumps showed row0_id != row1_id even though the two
+    # generations are identical token-for-token, meaning the captured
+    # forwards weren't "two-seq decode" forwards at all.
     worker._bisect_embed_inputs = []
     embed_inputs = worker._bisect_embed_inputs
 
     def embedding_hook(_module, inputs, output):
         try:
             out = _primary(output)
-            if out is None or out.dim() != 2 or out.shape[0] != 2:
+            if out is None:
                 return
-            storage.setdefault("embedding", []).append(out.detach().clone())
-            # inputs is a tuple; first positional is input_ids
+            # store the embedding output too, in case we want to do
+            # row-level comparisons later (only the bisect_storage path
+            # uses it; for now we just need inputs).
+            if out.dim() == 2 and out.shape[0] == 2:
+                storage.setdefault("embedding", []).append(out.detach().clone())
             if inputs and hasattr(inputs[0], "shape"):
                 embed_inputs.append(inputs[0].detach().clone())
             else:
@@ -399,27 +405,33 @@ def test_mxfp4_marlin_moe_layer_bisect_same_content_bs2(backend):
             flush=True,
         )
 
-        # Dump the actual token IDs at row 0 / row 1 for each captured
-        # forward. If row0 != row1, the [2, hidden] forward is NOT a
-        # clean same-content decode batch — it's a scheduling artifact
-        # (e.g. mixed prefill+decode, or two seqs at different decode
-        # offsets) and the bisect's "embedding diverges" reading is not
-        # a real numerical bug.
-        print("[bisect] embedding input_ids per captured forward:", flush=True)
+        # Dump every captured embedding forward unfiltered: shape, full
+        # input_ids list (or compact summary if long). This is the
+        # ground truth — we can read the schedule directly from these
+        # rows rather than guessing.
+        print(
+            f"[bisect] captured {len(embed_input_ids)} embedding "
+            f"forward(s) total",
+            flush=True,
+        )
         for i, ids in enumerate(embed_input_ids):
             if ids is None:
-                print(f"  step {i:2d}: <unavailable>", flush=True)
+                print(f"  fwd {i:2d}: <unavailable>", flush=True)
                 continue
-            if len(ids) >= 2:
-                row0 = ids[0]
-                row1 = ids[1]
-                tag = "SAME" if row0 == row1 else "DIFF"
+            n = len(ids)
+            if n <= 32:
+                print(f"  fwd {i:2d}: shape=[{n}] ids={ids}", flush=True)
+            else:
+                # Long forward (likely prefill): show the first few,
+                # last few, and any natural midpoint.
+                head = ids[:8]
+                tail = ids[-8:]
+                mid = ids[n // 2 - 4 : n // 2 + 4]
                 print(
-                    f"  step {i:2d}: row0_id={row0} row1_id={row1} {tag}",
+                    f"  fwd {i:2d}: shape=[{n}] head={head} "
+                    f"mid={mid} tail={tail}",
                     flush=True,
                 )
-            else:
-                print(f"  step {i:2d}: ids={ids}", flush=True)
 
         first_div_per_step: list[tuple[int, str | None, float]] = []
         for step in range(n_steps):
