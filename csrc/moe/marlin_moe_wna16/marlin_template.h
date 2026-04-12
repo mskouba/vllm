@@ -77,7 +77,8 @@ __global__ void Marlin(
     int prob_k,             // reduction dimension k
     int* locks,             // extra global storage for barrier synchronization
     bool use_atomic_add,    // whether to use atomic add to reduce
-    bool use_fp32_reduce    // whether to use fp32 global reduce
+    bool use_fp32_reduce,   // whether to use fp32 global reduce
+    bool no_k_split         // disable K-splitting for batch invariance
 ) {}
 
 }  // namespace MARLIN_NAMESPACE_NAME
@@ -279,7 +280,8 @@ __global__ void Marlin(
     int* locks,             // extra global storage for barrier synchronization
     bool has_bias,
     bool use_atomic_add,  // whether to use atomic add to reduce
-    bool use_fp32_reduce  // whether to use fp32 global reduce
+    bool use_fp32_reduce, // whether to use fp32 global reduce
+    bool no_k_split       // disable K-splitting for batch invariance
 ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
