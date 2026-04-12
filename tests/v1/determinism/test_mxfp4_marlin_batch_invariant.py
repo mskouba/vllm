@@ -321,6 +321,328 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
     )
 
 
+def _install_crossrun_hooks(worker) -> None:
+    """Install per-sub-module hooks for the cross-run bisect.
+
+    Two runs (BS=1 then BS=2) will be performed back-to-back. The hook
+    appends each forward's output (cloned, moved to CPU) into a
+    per-run, per-sub-module list:
+
+      worker._crossrun_runs = [
+        {sub_name: [out_fwd0, out_fwd1, ...]},  # run 0 = BS=1
+        {sub_name: [out_fwd0, out_fwd1, ...]},  # run 1 = BS=2
+      ]
+
+    Between the two runs the test calls ``_crossrun_start_new_run`` to
+    append a fresh empty dict, so the second generate's captures land
+    in run 1.
+    """
+    model = worker.model_runner.model
+    inner = getattr(model, "model", model)
+    layers = inner.layers
+
+    worker._crossrun_runs = [{}]
+
+    def _primary(tensor_or_tuple):
+        if isinstance(tensor_or_tuple, tuple):
+            for t in tensor_or_tuple:
+                if hasattr(t, "shape"):
+                    return t
+            return None
+        return tensor_or_tuple
+
+    def make_hook(name):
+        def hook(_module, _inputs, output):
+            try:
+                out = _primary(output)
+                if out is None or not hasattr(out, "shape"):
+                    return
+                # Move to CPU and clone so the captured tensor outlives
+                # the GPU buffer it was sliced from. Full tensor (not
+                # just row 0) so we can also sanity-check prefill.
+                cur = worker._crossrun_runs[-1]
+                cur.setdefault(name, []).append(out.detach().to("cpu").clone())
+            except Exception:
+                pass
+
+        return hook
+
+    handles = []
+    if hasattr(inner, "embedding"):
+        handles.append(inner.embedding.register_forward_hook(make_hook("embedding")))
+    for i, layer in enumerate(layers):
+        for sub in ("input_layernorm", "attn", "post_attention_layernorm", "mlp"):
+            mod = getattr(layer, sub, None)
+            if mod is not None:
+                handles.append(
+                    mod.register_forward_hook(
+                        make_hook(f"layer_{i:02d}.{sub}")
+                    )
+                )
+    if hasattr(inner, "norm"):
+        handles.append(inner.norm.register_forward_hook(make_hook("final_norm")))
+    worker._crossrun_handles = handles
+
+
+def _crossrun_start_new_run(worker) -> None:
+    """Start a fresh run target. Subsequent forwards land in a new dict."""
+    worker._crossrun_runs.append({})
+
+
+def _crossrun_compare(worker) -> dict:
+    """Compare BS=1 vs BS=2 captures and return a small summary dict.
+
+    For each sub-module name, walks forward indices in order. At each
+    index, compares row 0 of the BS=1 capture against row 0 of the
+    BS=2 capture (or, for fwd 0 prefill, the entire tensor since both
+    runs prefill seq0 alone with identical content).
+
+    Returns:
+      {
+        "n_forwards_bs1": int,
+        "n_forwards_bs2": int,
+        "ladder": [
+          {
+            "fwd": int,
+            "shape_bs1": [int, ...],
+            "shape_bs2": [int, ...],
+            "first_div_sub": str | None,
+            "first_div_max_abs": float,
+            "first_div_argmax": int,
+          },
+          ...
+        ],
+      }
+    """
+    import torch as _torch
+
+    runs = worker._crossrun_runs
+    if len(runs) < 2:
+        return {"error": f"need 2 runs, have {len(runs)}"}
+    bs1, bs2 = runs[0], runs[1]
+
+    # Topologically ordered sub-module list, mirroring the bisect test.
+    ordered_names = []
+    if "embedding" in bs1 and "embedding" in bs2:
+        ordered_names.append("embedding")
+    layer_keys = sorted(
+        k for k in bs1 if k.startswith("layer_") and "." in k
+    )
+    sub_order = ["input_layernorm", "attn", "post_attention_layernorm", "mlp"]
+    layer_indices = sorted(
+        {int(k.split("_")[1].split(".")[0]) for k in layer_keys}
+    )
+    for li in layer_indices:
+        for sub in sub_order:
+            key = f"layer_{li:02d}.{sub}"
+            if key in bs1 and key in bs2:
+                ordered_names.append(key)
+    if "final_norm" in bs1 and "final_norm" in bs2:
+        ordered_names.append("final_norm")
+
+    n_bs1 = max((len(bs1[n]) for n in ordered_names), default=0)
+    n_bs2 = max((len(bs2[n]) for n in ordered_names), default=0)
+    n_compare = min(n_bs1, n_bs2)
+
+    ladder = []
+    for fwd in range(n_compare):
+        # Use the first sub-module to get shapes for the dump.
+        first_name = ordered_names[0] if ordered_names else None
+        shape_bs1 = []
+        shape_bs2 = []
+        if first_name is not None:
+            try:
+                shape_bs1 = list(bs1[first_name][fwd].shape)
+                shape_bs2 = list(bs2[first_name][fwd].shape)
+            except Exception:
+                pass
+
+        first_div_sub = None
+        first_div_max = 0.0
+        first_div_argmax = -1
+        for name in ordered_names:
+            if fwd >= len(bs1[name]) or fwd >= len(bs2[name]):
+                continue
+            t1 = bs1[name][fwd]
+            t2 = bs2[name][fwd]
+            # Compare row 0 (the seq0 row in BS=2 decode forwards;
+            # also the first prefill token in fwd 0).
+            if t1.dim() < 2 or t2.dim() < 2:
+                continue
+            r1 = t1[0].float()
+            r2 = t2[0].float()
+            if r1.shape != r2.shape:
+                # Hidden size should match. If shapes differ, treat
+                # as a divergence — something structural is off.
+                first_div_sub = name
+                first_div_max = float("inf")
+                first_div_argmax = -1
+                break
+            if not _torch.equal(t1[0], t2[0]):
+                d = (r1 - r2).abs()
+                first_div_sub = name
+                first_div_max = float(d.max().item())
+                first_div_argmax = int(d.argmax().item())
+                break
+
+        ladder.append(
+            {
+                "fwd": fwd,
+                "shape_bs1": shape_bs1,
+                "shape_bs2": shape_bs2,
+                "first_div_sub": first_div_sub,
+                "first_div_max_abs": first_div_max,
+                "first_div_argmax": first_div_argmax,
+            }
+        )
+
+    # For the first divergent fwd, also dump the FULL ladder of sub-
+    # modules (not just first divergence) so we can see whether other
+    # paths also drift.
+    first_bad_fwd = next(
+        (entry["fwd"] for entry in ladder if entry["first_div_sub"] is not None),
+        None,
+    )
+    full_ladder = []
+    if first_bad_fwd is not None:
+        for name in ordered_names:
+            if first_bad_fwd >= len(bs1[name]) or first_bad_fwd >= len(
+                bs2[name]
+            ):
+                continue
+            t1 = bs1[name][first_bad_fwd]
+            t2 = bs2[name][first_bad_fwd]
+            if t1.dim() < 2 or t2.dim() < 2 or t1[0].shape != t2[0].shape:
+                continue
+            eq = bool(_torch.equal(t1[0], t2[0]))
+            d = (t1[0].float() - t2[0].float()).abs()
+            full_ladder.append(
+                {
+                    "name": name,
+                    "bitwise_equal": eq,
+                    "max_abs": float(d.max().item()),
+                    "argmax": int(d.argmax().item()),
+                }
+            )
+
+    # Clean up.
+    for h in getattr(worker, "_crossrun_handles", []):
+        h.remove()
+    worker._crossrun_handles = []
+    worker._crossrun_runs = []
+
+    return {
+        "n_forwards_bs1": n_bs1,
+        "n_forwards_bs2": n_bs2,
+        "n_compared": n_compare,
+        "ladder": ladder,
+        "first_bad_fwd": first_bad_fwd,
+        "full_ladder_first_bad": full_ladder,
+    }
+
+
+@skip_unsupported
+@pytest.mark.parametrize("backend", ["TRITON_ATTN"])
+def test_mxfp4_marlin_moe_crossrun_layer_bisect(backend):
+    """Cross-run per-layer bisect comparing BS=1 vs BS=2 for seq0.
+
+    Runs the same prompt twice on the same LLM instance — once at BS=1
+    and once at BS=2 (same content) — and captures every transformer
+    sub-module's output at every forward call. Then compares row 0 of
+    each capture (which is seq0 in BS=2 decode forwards) at matching
+    forward indices to find the first sub-module + forward index where
+    the BS=2 trace diverges from the BS=1 trace.
+
+    This pins down whether the residual cross-batch logprob drift on
+    gpt-oss-20b is:
+      (a) a sub-1ULP perturbation that grows over decode steps and
+          shows up at the lm_head only at fwd 3+, or
+      (b) a discrete K/V cache write divergence at fwd 2 that
+          contaminates fwd 3+ reads, or
+      (c) something else entirely.
+    """
+    sampling = SamplingParams(
+        temperature=0.0,
+        top_p=1.0,
+        top_k=-1,
+        max_tokens=8,
+        logprobs=5,
+    )
+    needle_prompt = "Write one factual sentence about the moon."
+    llm = None
+    try:
+        llm = _make_llm(max_num_seqs=8, backend=backend)
+        llm.llm_engine.collective_rpc(_install_crossrun_hooks)
+
+        # Run 1: BS=1 baseline.
+        llm.generate([needle_prompt], sampling, use_tqdm=False)
+
+        # Switch to a fresh capture target before the second run.
+        llm.llm_engine.collective_rpc(_crossrun_start_new_run)
+
+        # Run 2: BS=2 same content.
+        llm.generate(
+            [needle_prompt, needle_prompt], sampling, use_tqdm=False
+        )
+
+        result = llm.llm_engine.collective_rpc(_crossrun_compare)[0]
+
+        if "error" in result:
+            pytest.fail(f"crossrun compare error: {result['error']}")
+
+        print(
+            f"\n[crossrun] BS=1 forwards: {result['n_forwards_bs1']}, "
+            f"BS=2 forwards: {result['n_forwards_bs2']}, "
+            f"compared: {result['n_compared']}",
+            flush=True,
+        )
+        print("[crossrun] per-fwd first divergence (row 0 only):", flush=True)
+        for entry in result["ladder"]:
+            if entry["first_div_sub"] is None:
+                print(
+                    f"  fwd {entry['fwd']:2d} "
+                    f"shapes bs1={entry['shape_bs1']} "
+                    f"bs2={entry['shape_bs2']}: all sub-modules EQUAL",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"  fwd {entry['fwd']:2d} "
+                    f"shapes bs1={entry['shape_bs1']} "
+                    f"bs2={entry['shape_bs2']}: first DIFF at "
+                    f"{entry['first_div_sub']} "
+                    f"max_abs={entry['first_div_max_abs']:.4e} "
+                    f"argmax={entry['first_div_argmax']}",
+                    flush=True,
+                )
+
+        if result["first_bad_fwd"] is not None:
+            print(
+                f"\n[crossrun] full sub-module ladder for earliest "
+                f"divergent fwd {result['first_bad_fwd']}:",
+                flush=True,
+            )
+            for entry in result["full_ladder_first_bad"]:
+                tag = "EQ  " if entry["bitwise_equal"] else "DIFF"
+                print(
+                    f"  {tag} {entry['name']}: max_abs="
+                    f"{entry['max_abs']:.4e} argmax={entry['argmax']}",
+                    flush=True,
+                )
+
+        # Diagnostic test: should fail (and dump the ladder) until the
+        # cross-batch divergence is fixed.
+        assert result["first_bad_fwd"] is None, (
+            f"BS=1 vs BS=2 row 0 diverges starting at fwd "
+            f"{result['first_bad_fwd']}; see ladder above for the "
+            f"offending sub-module."
+        )
+    finally:
+        if llm is not None:
+            with contextlib.suppress(Exception):
+                llm.shutdown()
+
+
 def _install_bisect_hooks(worker) -> None:
     """Install per-sub-module forward hooks on every transformer block.
 
