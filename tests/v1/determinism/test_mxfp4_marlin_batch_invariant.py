@@ -331,7 +331,28 @@ def test_mxfp4_marlin_moe_layer_bisect_same_content_bs2(backend):
         # Run a same-content BS=2 greedy generation. Decode steps will be
         # forward calls with [2, hidden] inputs/outputs (one token per
         # sequence per step) — the hooks select exactly those.
-        llm.generate([needle_prompt, needle_prompt], sampling, use_tqdm=False)
+        pair = llm.generate(
+            [needle_prompt, needle_prompt], sampling, use_tqdm=False
+        )
+
+        # Print the actual generated token IDs of both sequences. This
+        # is the unambiguous ground truth: if pair[0].token_ids ==
+        # pair[1].token_ids, the two sequences are on the same token
+        # stream and any "embedding row0 != row1" reading must be a
+        # capture artifact (mixed batch / wrong forwards). If they
+        # differ at position 0, prefill itself sampled different T0.
+        ids0 = list(pair[0].outputs[0].token_ids)
+        ids1 = list(pair[1].outputs[0].token_ids)
+        print(f"\n[bisect] pair[0].token_ids = {ids0}", flush=True)
+        print(f"[bisect] pair[1].token_ids = {ids1}", flush=True)
+        first_div_pos = next(
+            (i for i in range(min(len(ids0), len(ids1))) if ids0[i] != ids1[i]),
+            None,
+        )
+        print(
+            f"[bisect] first divergent generated position: {first_div_pos}",
+            flush=True,
+        )
 
         results = llm.llm_engine.collective_rpc(_collect_bisect_results)[0]
 
