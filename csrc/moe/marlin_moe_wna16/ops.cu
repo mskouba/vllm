@@ -484,22 +484,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   int thread_k_blocks = thread_k / 16;
   int thread_n_blocks = thread_n / 16;
 
-  // Under batch-invariance (indicated by an explicit thread config and
-  // blocks_per_sm), override the grid size so that gridDim.x equals the
-  // total number of (moe_block, n_tile) pairs.  This forces the kernel into
-  // pure data-parallel mode (no Stream-K), meaning every output tile is
-  // handled entirely by one threadblock — no K-splitting, no c_tmp
-  // reduction, and therefore bitwise-identical results regardless of M.
-  if (thread_k != -1 && thread_n != -1) {
-    int parallel =
-        sorted_token_ids.size(0) / moe_block_size;  // num MoE blocks
-    int n_tiles = prob_n / (16 * thread_n_blocks);
-    int global_mn_tiles = parallel * n_tiles;
-    if (global_mn_tiles > blocks) {
-      blocks = global_mn_tiles;
-    }
-  }
-
   TORCH_CHECK(is_valid_config(thread_tfg, m_block_size_8, thread_m_blocks,
                               prob_m, prob_n, prob_k, num_bits, group_size,
                               has_act_order, is_k_full, has_zp, is_zp_float,
@@ -869,6 +853,26 @@ torch::Tensor moe_wna16_marlin_gemm(
         "scalar type of a must be the same with c for 16 bit activation");
   }
 
+  // Under batch-invariance (indicated by an explicit thread config via
+  // thread_k/thread_n), override sms so that gridDim.x (= sms * blocks_per_sm)
+  // is at least global_mn_tiles.  This forces the kernel into pure
+  // data-parallel mode (no Stream-K K-splitting), so every output tile is
+  // handled entirely by one threadblock — no c_tmp reduction, and therefore
+  // bitwise-identical results regardless of M.
+  int launch_sms = sms;
+  if (thread_k > 0 && thread_n > 0) {
+    int thread_n_blocks = thread_n / 16;
+    int parallel =
+        (int)(sorted_token_ids.size(0) / moe_block_size);  // num MoE blocks
+    int n_tiles = size_n / (16 * thread_n_blocks);
+    int global_mn_tiles = parallel * n_tiles;
+    int bps = blocks_per_sm > 0 ? blocks_per_sm : 1;
+    int needed_sms = (global_mn_tiles + bps - 1) / bps;
+    if (needed_sms > launch_sms) {
+      launch_sms = needed_sms;
+    }
+  }
+
   MARLIN_NAMESPACE_NAME::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),
       b_bias.data_ptr(), a_scales.data_ptr(), b_scales.data_ptr(),
@@ -879,8 +883,8 @@ torch::Tensor moe_wna16_marlin_gemm(
       mul_topk_weights, size_m, size_n, size_k, workspace.data_ptr(), a_type,
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
-      thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
-      is_zp_float);
+      thread_k, thread_n, launch_sms, blocks_per_sm, use_atomic_add,
+      use_fp32_reduce, is_zp_float);
 
   return c;
 }
