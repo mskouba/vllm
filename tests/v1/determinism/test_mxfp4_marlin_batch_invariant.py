@@ -114,6 +114,126 @@ def _marlin_moe_unit_probe(worker) -> dict:
     }
 
 
+def _marlin_moe_unit_probe_m2(worker) -> dict:
+    """Decode-time M=2 unit probe for ``fused_marlin_moe``.
+
+    The original ``_marlin_moe_unit_probe`` compares M=1 to M=8 sharing
+    row 0. That covers the prefill regime well but misses the M=2 case
+    that every BS=2 decode forward actually hits — and the residual
+    cross-batch logprob drift on gpt-oss-20b first appears at decode
+    forward 3 (M=2 row 0). This probe runs three checks at the actual
+    decode-time M:
+
+      1. M=1 vs M=2 with shared row 0   (cross-M row invariance)
+      2. M=2 row 0 vs M=2 row 1, both rows identical   (intra-batch
+         row invariance at M=2)
+      3. M=2 vs M=2 across two separate calls with identical input
+         (kernel call self-consistency at M=2)
+
+    If any of these fail, the residual drift is intrinsic to Marlin
+    MoE at small M and we go back into the kernel. If all pass, the
+    drift is upstream of MoE (attention sinks / SWA / RMSNorm) and we
+    do the cross-run layer bisect next.
+    """
+    import torch as _torch
+
+    from vllm.forward_context import set_forward_context
+
+    model_runner = worker.model_runner
+    vllm_config = model_runner.vllm_config
+    model = model_runner.model
+    inner = getattr(model, "model", model)
+    mlp = inner.layers[0].mlp
+
+    device = next(mlp.parameters()).device
+    dtype = mlp.router.weight.dtype
+    K = mlp.hidden_size
+
+    _torch.manual_seed(20240919)
+    row = _torch.randn(K, device=device, dtype=dtype)
+
+    hs_1 = row.unsqueeze(0).clone()                  # [1, K]
+    hs_2 = _torch.stack([row, row], dim=0).clone()   # [2, K], both rows equal
+    hs_2_dup = _torch.stack([row, row], dim=0).clone()
+    assert _torch.equal(hs_1[0], hs_2[0])
+    assert _torch.equal(hs_2[0], hs_2[1])
+
+    def _run(hs):
+        with set_forward_context(
+            attn_metadata=None,
+            vllm_config=vllm_config,
+            num_tokens=hs.shape[0],
+        ):
+            return mlp(hs)
+
+    with _torch.inference_mode():
+        out_1 = _run(hs_1)
+        out_2 = _run(hs_2)
+        out_2b = _run(hs_2_dup)
+
+    # Slice to hidden size — gpt-oss MoE returns [..., hidden + extras]
+    # in some configurations; the original probe does the same.
+    o1_r0 = out_1[0, :K].float()
+    o2_r0 = out_2[0, :K].float()
+    o2_r1 = out_2[1, :K].float()
+    o2b_r0 = out_2b[0, :K].float()
+
+    def _summarize(a, b):
+        d = (a - b).abs()
+        return {
+            "max_abs": float(d.max().item()),
+            "max_idx": int(d.argmax().item()),
+            "bitwise_equal": bool(_torch.equal(a, b)),
+        }
+
+    return {
+        "m1_vs_m2_row0": _summarize(o1_r0, o2_r0),
+        "m2_row0_vs_row1": _summarize(o2_r0, o2_r1),
+        "m2_self_consistency_row0": _summarize(o2_r0, o2b_r0),
+    }
+
+
+@skip_unsupported
+@pytest.mark.parametrize("backend", ["TRITON_ATTN"])
+def test_mxfp4_marlin_moe_unit_invariance_m2(backend):
+    """Decode-time M=2 unit-level invariance probe.
+
+    Companion to ``test_mxfp4_marlin_moe_unit_invariance`` (which
+    covers M=1 vs M=8). This one targets exactly the M every BS=2
+    decode forward hits, and asserts both cross-M (M=1 vs M=2) and
+    intra-batch (M=2 row 0 vs row 1) row invariance for
+    ``fused_marlin_moe``.
+    """
+    llm = None
+    try:
+        llm = _make_llm(max_num_seqs=8, backend=backend)
+        results = llm.llm_engine.collective_rpc(_marlin_moe_unit_probe_m2)
+        result = results[0]
+        for name, summary in result.items():
+            print(
+                f"[unit M=2] {name}: max_abs={summary['max_abs']:.4e} "
+                f"argmax={summary['max_idx']} "
+                f"bitwise_equal={summary['bitwise_equal']}",
+                flush=True,
+            )
+
+        failures = [
+            name for name, s in result.items() if not s["bitwise_equal"]
+        ]
+        assert not failures, (
+            f"M=2 unit-level invariance failed for: {failures}. "
+            f"Per-check details:\n  "
+            + "\n  ".join(
+                f"{n}: max_abs={s['max_abs']:.4e} at idx={s['max_idx']}"
+                for n, s in result.items()
+            )
+        )
+    finally:
+        if llm is not None:
+            with contextlib.suppress(Exception):
+                llm.shutdown()
+
+
 @skip_unsupported
 @pytest.mark.parametrize("backend", ["TRITON_ATTN"])
 def test_mxfp4_marlin_moe_unit_invariance(backend):
