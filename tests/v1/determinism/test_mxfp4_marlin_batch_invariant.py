@@ -481,15 +481,31 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
         # (the return value of the second GEMM) while running through the
         # normal MLP path so all weight formats are handled correctly.
         import vllm.model_executor.layers.fused_moe.fused_marlin_moe as _fmm
+        from vllm import _custom_ops as _ops_mod
 
         _capture_buf = {}
         _orig_fused = _fmm._fused_marlin_moe
+        _orig_gemm = _ops_mod.moe_wna16_marlin_gemm
+        _gemm_call_idx = [0]
+
+        def _capturing_gemm(*args, **kwargs):
+            out = _orig_gemm(*args, **kwargs)
+            idx = _gemm_call_idx[0]
+            _gemm_call_idx[0] += 1
+            # GEMM1 (gate_up) is call 0, GEMM2 (down_proj) is call 1
+            _capture_buf[f"gemm{idx}"] = out.clone()
+            return out
 
         def _capturing_fused(*args, **kwargs):
-            out = _orig_fused(*args, **kwargs)
+            _gemm_call_idx[0] = 0
+            # Temporarily patch the GEMM op
+            _fmm.ops.moe_wna16_marlin_gemm = _capturing_gemm
+            try:
+                out = _orig_fused(*args, **kwargs)
+            finally:
+                _fmm.ops.moe_wna16_marlin_gemm = _orig_gemm
             # out shape: [M*topk, K] — clone to avoid aliasing
             _capture_buf["pre_sum"] = out.clone()
-            # Also capture dimensions
             hs = args[0] if args else kwargs["hidden_states"]
             _capture_buf["M"] = hs.shape[0]
             return out
@@ -503,6 +519,9 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
             _capture_buf.clear()
             out_bs1_full2 = _run_mlp(inp_bs1)
             pre_sum_bs1 = _capture_buf["pre_sum"]  # [topk, K_padded]
+            gemm1_bs1_snap = _capture_buf.get("gemm0")
+            if gemm1_bs1_snap is not None:
+                gemm1_bs1_snap = gemm1_bs1_snap.clone()
             results["pre_sum_bs1_shape"] = list(pre_sum_bs1.shape)
 
             # Mixed M=2 run (seed 6 = known failure)
@@ -513,7 +532,32 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
             _capture_buf.clear()
             out_mixed = _run_mlp(mixed)
             pre_sum_mixed = _capture_buf["pre_sum"]  # [2*topk, K_padded]
+            gemm1_mixed_snap = _capture_buf.get("gemm0")
+            if gemm1_mixed_snap is not None:
+                gemm1_mixed_snap = gemm1_mixed_snap.clone()
             results["pre_sum_mixed_shape"] = list(pre_sum_mixed.shape)
+
+            # Store for GEMM1 comparison below
+            _capture_buf["gemm1_bs1"] = gemm1_bs1_snap
+            _capture_buf["gemm1_mixed"] = gemm1_mixed_snap
+
+            # Compare GEMM1 (gate_up) output for slot 0
+            gemm1_bs1 = _capture_buf.get("gemm1_bs1")
+            gemm1_mixed = _capture_buf.get("gemm1_mixed")
+            if gemm1_bs1 is not None and gemm1_mixed is not None:
+                g1_bs1_s0 = gemm1_bs1[0, :].float()
+                g1_mix_s0 = gemm1_mixed[0, :].float()
+                g1_diff = (g1_bs1_s0 - g1_mix_s0).abs()
+                g1_eq = bool(_torch.equal(g1_bs1_s0, g1_mix_s0))
+                g1_n_diff = int((g1_diff > 0).sum().item())
+                g1_max = float(g1_diff.max().item())
+                g1_idxs = _torch.nonzero(
+                    g1_diff > 0).squeeze(-1).tolist() if g1_max > 0 else []
+                results["gemm1_slot0_eq"] = g1_eq
+                results["gemm1_slot0_n_diff"] = g1_n_diff
+                results["gemm1_slot0_max_diff"] = g1_max
+                results["gemm1_slot0_diff_indices"] = g1_idxs[:32]
+                results["gemm1_shape"] = list(gemm1_bs1.shape)
 
             # Compare pre-sum output for each topk slot of token 0
             slot_diffs = []
