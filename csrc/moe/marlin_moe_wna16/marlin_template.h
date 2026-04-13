@@ -915,9 +915,9 @@ __global__ void Marlin(
   FragZP frag_zp;                        // Zero-points in fp16
   FragZP frag_zpf[2];                    // Zero-points in fp16 in HQQ
 
-  if constexpr (is_a_8bit && group_blocks != -1) {
+  if constexpr (group_blocks != -1) {
   #pragma unroll
-    for (int j = 0; j < 2; j++) {
+    for (int j = 0; j < (is_a_8bit ? 2 : 4); j++) {
   #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
   #pragma unroll
