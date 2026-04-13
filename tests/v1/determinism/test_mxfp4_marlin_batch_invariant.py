@@ -500,12 +500,22 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
 
             out_mixed = _run_mlp(mixed)
             r_mixed = out_mixed[0, :K].float()
+            diff = (r_bs1 - r_mixed).abs()
             eq = bool(_torch.equal(r_bs1, r_mixed))
-            md = float((r_bs1 - r_mixed).abs().max().item())
+            md = float(diff.max().item())
+            argmax = int(diff.argmax().item()) if md > 0 else -1
+            # For failures, also get the actual values at the diff point
+            val_bs1 = float(r_bs1[argmax].item()) if argmax >= 0 else 0
+            val_mixed = float(r_mixed[argmax].item()) if argmax >= 0 else 0
+            n_diff_elems = int((diff > 0).sum().item())
             sweep_results.append({
                 "seed": seed, "eq": eq, "max_diff": md,
                 "overlap": overlap,
                 "row1_experts": row1_experts,
+                "argmax": argmax,
+                "val_bs1": val_bs1,
+                "val_mixed": val_mixed,
+                "n_diff_elems": n_diff_elems,
             })
 
         n_fail = sum(1 for s in sweep_results if not s["eq"])
