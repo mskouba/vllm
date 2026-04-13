@@ -347,6 +347,167 @@ def _replay_mlp_at_layer(worker, layer_idx: int,
     }
 
 
+def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
+                                    fwd_bs1: int, fwd_bs2: int,
+                                    row_bs2: int) -> dict:
+    """Decomposed MoE replay: test each sub-operation independently.
+
+    Breaks the MoE layer into: router → topk → moe_align → GEMM1 →
+    activation → GEMM2 → moe_sum, and checks each intermediate result
+    between M=1 and M=2 for the needle row.  This identifies exactly
+    which sub-operation introduces the batch-dependent divergence.
+    """
+    import torch as _torch
+
+    from vllm.forward_context import set_forward_context
+    from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
+        _fused_marlin_moe,
+        fused_marlin_moe,
+    )
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+    _, db = _get_bisect_db(worker)
+    caps = db["captures"]
+    if fwd_bs1 >= len(caps) or fwd_bs2 >= len(caps):
+        return {"error": "index out of range"}
+
+    key = f"L{layer_idx}_mlp_in"
+    if key not in caps[fwd_bs1] or key not in caps[fwd_bs2]:
+        return {"error": f"key {key} not found in captures"}
+
+    model_runner = worker.model_runner
+    vllm_config = model_runner.vllm_config
+    model = model_runner.model
+    inner = getattr(model, "model", model)
+    mlp = inner.layers[layer_idx].mlp
+    device = next(mlp.parameters()).device
+    dtype = mlp.router.weight.dtype
+
+    inp_bs1_f32 = caps[fwd_bs1][key]
+    inp_bs2_f32 = caps[fwd_bs2][key]
+    inp_bs1 = inp_bs1_f32.to(dtype=dtype, device=device)
+    inp_bs2 = inp_bs2_f32.to(dtype=dtype, device=device)
+    K = mlp.hidden_size
+
+    results = {}
+
+    with _torch.inference_mode():
+        # ---- Step 1: Router ----
+        with set_forward_context(attn_metadata=None, vllm_config=vllm_config,
+                                 num_tokens=1):
+            g_bs1 = mlp.router(inp_bs1)
+        with set_forward_context(attn_metadata=None, vllm_config=vllm_config,
+                                 num_tokens=2):
+            g_bs2 = mlp.router(inp_bs2)
+        # ReplicatedLinear returns (output, bias) tuple
+        if isinstance(g_bs1, tuple):
+            g_bs1 = g_bs1[0]
+        if isinstance(g_bs2, tuple):
+            g_bs2 = g_bs2[0]
+        results["router_logits_eq"] = bool(
+            _torch.equal(g_bs1[0].float(), g_bs2[row_bs2].float()))
+        results["router_max_diff"] = float(
+            (g_bs1[0].float() - g_bs2[row_bs2].float()).abs().max().item())
+
+        # ---- Step 2: TopK routing ----
+        # Get the FusedMoE module (mlp.experts) to access its router
+        experts_mod = mlp.experts
+        # Use the router's select_experts if available
+        if hasattr(experts_mod, '_moe_runner') and hasattr(
+                experts_mod._moe_runner, 'router'):
+            router = experts_mod._moe_runner.router
+            tw_bs1, ti_bs1 = router.select_experts(
+                hidden_states=inp_bs1, router_logits=g_bs1)
+            tw_bs2, ti_bs2 = router.select_experts(
+                hidden_states=inp_bs2, router_logits=g_bs2)
+        else:
+            # Fallback: use the module's select_and_reduce
+            tw_bs1, ti_bs1 = experts_mod.select_and_reduce(
+                router_logits=g_bs1)
+            tw_bs2, ti_bs2 = experts_mod.select_and_reduce(
+                router_logits=g_bs2)
+
+        results["topk_ids_eq"] = bool(
+            _torch.equal(ti_bs1[0], ti_bs2[row_bs2]))
+        results["topk_weights_eq"] = bool(
+            _torch.equal(tw_bs1[0].float(), tw_bs2[row_bs2].float()))
+        results["topk_ids_bs1"] = ti_bs1[0].tolist()
+        results["topk_ids_bs2_needle"] = ti_bs2[row_bs2].tolist()
+        results["topk_weights_bs1"] = [
+            f"{x:.6f}" for x in tw_bs1[0].tolist()]
+        results["topk_weights_bs2_needle"] = [
+            f"{x:.6f}" for x in tw_bs2[row_bs2].tolist()]
+
+        # ---- Step 3: moe_align_block_size ----
+        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+            moe_align_block_size,
+        )
+        block_size_m = 64
+        E = ti_bs1.shape[1]  # This is topk, not num_experts
+        # Get the actual num_experts from the weights
+        qm = experts_mod._moe_runner.quant_method
+        if hasattr(qm, 'fused_experts'):
+            fe = qm.fused_experts
+        else:
+            fe = qm
+        # Try to get global_num_experts
+        global_num_experts = -1
+        if hasattr(fe, 'moe_config'):
+            global_num_experts = fe.moe_config.num_experts
+        elif hasattr(experts_mod, 'num_experts'):
+            global_num_experts = experts_mod.num_experts
+
+        stids_bs1, eids_bs1, ntpp_bs1 = moe_align_block_size(
+            ti_bs1, block_size_m, global_num_experts, None)
+        stids_bs2, eids_bs2, ntpp_bs2 = moe_align_block_size(
+            ti_bs2, block_size_m, global_num_experts, None)
+
+        # For each expert in BS=1, find which block-local position the
+        # needle's slot is at
+        topk = ti_bs1.shape[1]
+        results["moe_align_num_blocks_bs1"] = int(ntpp_bs1.item()) // block_size_m
+        results["moe_align_num_blocks_bs2"] = int(ntpp_bs2.item()) // block_size_m
+
+        # ---- Step 4: Call fused_marlin_moe with identical routing ----
+        # Use BS=1's routing for BOTH calls — this isolates whether the
+        # kernel itself (given identical routing) produces M-dependent output.
+        #
+        # Build a synthetic M=2 input where row 0 = BS=1 input and
+        # row 1 = BS=1 input (duplicate), with BS=1's topk_ids/weights
+        # replicated.
+        hs_dup = inp_bs1.expand(2, -1).contiguous()  # [2, K]
+        ti_dup = ti_bs1.expand(2, -1).contiguous()    # [2, topk]
+        tw_dup = tw_bs1.expand(2, -1).contiguous()    # [2, topk]
+
+        # Call the full MoE (mlp) with controlled inputs
+        def _run_mlp(hs):
+            with set_forward_context(attn_metadata=None,
+                                     vllm_config=vllm_config,
+                                     num_tokens=hs.shape[0]):
+                return mlp(hs)
+
+        out_bs1_full = _run_mlp(inp_bs1)
+        # Also try calling with duplicated M=2 using same input
+        out_dup = _run_mlp(hs_dup)
+
+        r_bs1 = out_bs1_full[0, :K].float()
+        r_dup = out_dup[0, :K].float()
+        diff_dup = (r_bs1 - r_dup).abs()
+
+        results["dup_m2_bitwise_eq"] = bool(_torch.equal(r_bs1, r_dup))
+        results["dup_m2_max_diff"] = float(diff_dup.max().item())
+
+        # Now try with the actual BS=2 input
+        out_bs2_full = _run_mlp(inp_bs2)
+        r_bs2 = out_bs2_full[row_bs2, :K].float()
+        diff_real = (r_bs1 - r_bs2).abs()
+
+        results["real_m2_bitwise_eq"] = bool(_torch.equal(r_bs1, r_bs2))
+        results["real_m2_max_diff"] = float(diff_real.max().item())
+
+    return results
+
+
 def _compare_decode_bisect(worker, fwd_bs1: int, row_bs1: int,
                            fwd_bs2: int, row_bs2: int) -> list[dict]:
     """Compare hidden states at every layer between two captures.
@@ -588,6 +749,23 @@ def test_mxfp4_marlin_moe_decode_layer_bisect(backend):
                         ),
                     )[0]
                     for k, v in sorted(replay.items()):
+                        print(f"  {k}: {v}", flush=True)
+
+                    # Decomposed replay: test each sub-op
+                    print(
+                        f"\n--- Decomposed MoE replay at layer "
+                        f"{layer_idx} ---",
+                        flush=True,
+                    )
+                    decomp = llm.llm_engine.collective_rpc(
+                        lambda w, li=layer_idx, f1=abs_fwd_bs1,
+                        f2=abs_fwd_bs2, r2=needle_row: (
+                            _decomposed_replay_mlp_at_layer(
+                                w, li, f1, f2, r2
+                            )
+                        ),
+                    )[0]
+                    for k, v in sorted(decomp.items()):
                         print(f"  {k}: {v}", flush=True)
 
         if not found_first_diff:
