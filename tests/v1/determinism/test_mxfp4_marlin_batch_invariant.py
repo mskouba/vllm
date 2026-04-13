@@ -476,6 +476,17 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
         results["dup_m2_bitwise_eq"] = bool(_torch.equal(r_bs1, r_dup))
         results["dup_m2_max_diff"] = float(diff_dup.max().item())
 
+        # Test with row 0 real input + random row 1 (different routing)
+        _torch.manual_seed(42)
+        rand_row = _torch.randn(1, inp_bs1.shape[1],
+                                device=device, dtype=dtype)
+        mixed = _torch.cat([inp_bs1, rand_row], dim=0)  # [2, K]
+        out_mixed = _run_mlp(mixed)
+        r_mixed = out_mixed[0, :K].float()
+        diff_mixed = (r_bs1 - r_mixed).abs()
+        results["mixed_m2_bitwise_eq"] = bool(_torch.equal(r_bs1, r_mixed))
+        results["mixed_m2_max_diff"] = float(diff_mixed.max().item())
+
         # Now try with the actual BS=2 input
         out_bs2_full = _run_mlp(inp_bs2)
         r_bs2 = out_bs2_full[row_bs2, :K].float()
@@ -483,6 +494,16 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
 
         results["real_m2_bitwise_eq"] = bool(_torch.equal(r_bs1, r_bs2))
         results["real_m2_max_diff"] = float(diff_real.max().item())
+
+        # Test M=3 with two random rows (different grid size again)
+        rand_row2 = _torch.randn(1, inp_bs1.shape[1],
+                                 device=device, dtype=dtype)
+        triple = _torch.cat([inp_bs1, rand_row, rand_row2], dim=0)
+        out_triple = _run_mlp(triple)
+        r_triple = out_triple[0, :K].float()
+        diff_triple = (r_bs1 - r_triple).abs()
+        results["triple_m3_bitwise_eq"] = bool(_torch.equal(r_bs1, r_triple))
+        results["triple_m3_max_diff"] = float(diff_triple.max().item())
 
     return results
 
