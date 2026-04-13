@@ -508,6 +508,16 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
             _capture_buf["pre_sum"] = out.clone()
             hs = args[0] if args else kwargs["hidden_states"]
             _capture_buf["M"] = hs.shape[0]
+            # Capture inputs for invariance verification
+            _capture_buf["hs_row0"] = hs[0].clone()
+            stids = (args[13] if len(args) > 13
+                     else kwargs.get("sorted_token_ids"))
+            if stids is not None:
+                _capture_buf["sorted_token_ids"] = stids.clone()
+            eids = (args[14] if len(args) > 14
+                    else kwargs.get("expert_ids"))
+            if eids is not None:
+                _capture_buf["expert_ids"] = eids.clone()
             return out
 
         _fmm._fused_marlin_moe = _capturing_fused
@@ -522,6 +532,15 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
             gemm1_bs1_snap = _capture_buf.get("gemm0")
             if gemm1_bs1_snap is not None:
                 gemm1_bs1_snap = gemm1_bs1_snap.clone()
+            hs_row0_bs1 = _capture_buf.get("hs_row0")
+            if hs_row0_bs1 is not None:
+                hs_row0_bs1 = hs_row0_bs1.clone()
+            stids_bs1 = _capture_buf.get("sorted_token_ids")
+            if stids_bs1 is not None:
+                stids_bs1 = stids_bs1.clone()
+            eids_bs1 = _capture_buf.get("expert_ids")
+            if eids_bs1 is not None:
+                eids_bs1 = eids_bs1.clone()
             results["pre_sum_bs1_shape"] = list(pre_sum_bs1.shape)
 
             # Mixed M=2 run (seed 6 = known failure)
@@ -535,7 +554,40 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
             gemm1_mixed_snap = _capture_buf.get("gemm0")
             if gemm1_mixed_snap is not None:
                 gemm1_mixed_snap = gemm1_mixed_snap.clone()
+            hs_row0_mixed = _capture_buf.get("hs_row0")
+            if hs_row0_mixed is not None:
+                hs_row0_mixed = hs_row0_mixed.clone()
+            stids_mixed = _capture_buf.get("sorted_token_ids")
+            if stids_mixed is not None:
+                stids_mixed = stids_mixed.clone()
+            eids_mixed = _capture_buf.get("expert_ids")
+            if eids_mixed is not None:
+                eids_mixed = eids_mixed.clone()
             results["pre_sum_mixed_shape"] = list(pre_sum_mixed.shape)
+
+            # ---- Input invariance check ----
+            if hs_row0_bs1 is not None and hs_row0_mixed is not None:
+                hs_eq = bool(_torch.equal(hs_row0_bs1, hs_row0_mixed))
+                results["hs_row0_bitwise_eq"] = hs_eq
+                if not hs_eq:
+                    hs_diff = (hs_row0_bs1.float()
+                               - hs_row0_mixed.float()).abs()
+                    results["hs_row0_n_diff"] = int(
+                        (hs_diff > 0).sum().item())
+                    results["hs_row0_max_diff"] = float(
+                        hs_diff.max().item())
+                    results["hs_row0_diff_indices"] = (
+                        _torch.nonzero(hs_diff > 0)
+                        .squeeze(-1).tolist()[:32])
+            if stids_bs1 is not None and stids_mixed is not None:
+                results["stids_bs1_len"] = len(stids_bs1)
+                results["stids_mixed_len"] = len(stids_mixed)
+                # Show first 16 entries of each
+                results["stids_bs1_head"] = stids_bs1[:16].tolist()
+                results["stids_mixed_head"] = stids_mixed[:16].tolist()
+            if eids_bs1 is not None and eids_mixed is not None:
+                results["eids_bs1"] = eids_bs1.tolist()[:8]
+                results["eids_mixed"] = eids_mixed.tolist()[:8]
 
             # Store for GEMM1 comparison below
             _capture_buf["gemm1_bs1"] = gemm1_bs1_snap
