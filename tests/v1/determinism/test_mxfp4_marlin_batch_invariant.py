@@ -187,6 +187,8 @@ def _install_decode_bisect_hooks(worker) -> None:
                     db["captures"][-1]["positions"] = (
                         args[1].detach().cpu().clone()
                     )
+                if not db["captures"]:
+                    return  # guard: partial/warmup forward
                 db["captures"][-1][f"L{idx}_attn_in"] = (
                     args[0].detach().float().cpu()
                 )
@@ -194,6 +196,8 @@ def _install_decode_bisect_hooks(worker) -> None:
 
         def _make_mlp_pre(idx):
             def hook(mod, args):
+                if not db["captures"]:
+                    return  # guard: partial/warmup forward
                 db["captures"][-1][f"L{idx}_mlp_in"] = (
                     args[0].detach().float().cpu()
                 )
