@@ -210,6 +210,20 @@ def _install_decode_bisect_hooks(worker) -> None:
             layer.mlp.register_forward_pre_hook(_make_mlp_pre(i))
         )
 
+    # Hook the final RMSNorm (input to lm_head) to capture the model's
+    # output hidden states.  This catches divergence in the last layer's
+    # MoE output that the per-layer pre-hooks would miss.
+    if hasattr(inner, "norm"):
+        def _final_norm_hook(mod, args):
+            if not db["captures"]:
+                return
+            db["captures"][-1]["final_norm_in"] = (
+                args[0].detach().float().cpu()
+            )
+        db["hooks"].append(
+            inner.norm.register_forward_pre_hook(_final_norm_hook)
+        )
+
 
 def _reset_decode_bisect(worker) -> None:
     _, db = _get_bisect_db(worker)
@@ -311,7 +325,7 @@ def test_mxfp4_marlin_moe_decode_layer_bisect(backend):
     """
     needle_prompt = "Write one factual sentence about the moon."
     filler_prompt = "Explain photosynthesis in simple terms for a child."
-    max_tokens = 3
+    max_tokens = 16
 
     sampling = SamplingParams(
         temperature=0,
