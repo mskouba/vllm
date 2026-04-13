@@ -266,6 +266,87 @@ def _get_decode_bisect_captures(worker) -> list[dict]:
     return out
 
 
+def _replay_mlp_at_layer(worker, layer_idx: int,
+                         fwd_bs1: int, fwd_bs2: int,
+                         row_bs2: int) -> dict:
+    """Replay the MoE at a specific layer with captured inputs.
+
+    Takes the BS=1 input (M=1) and the BS=2 input (M=M_bs2) from the
+    captures.  Runs the MoE layer standalone in both configurations and
+    checks if row 0 of the M=1 output equals row ``row_bs2`` of the
+    M=M_bs2 output.  Then also runs M=1 vs M=1 (just the needle row
+    from the BS=2 capture) to see if the layer is invariant for M=1.
+    """
+    import torch as _torch
+
+    from vllm.forward_context import set_forward_context
+
+    _, db = _get_bisect_db(worker)
+    caps = db["captures"]
+    if fwd_bs1 >= len(caps) or fwd_bs2 >= len(caps):
+        return {"error": "index out of range"}
+
+    key = f"L{layer_idx}_mlp_in"
+    if key not in caps[fwd_bs1] or key not in caps[fwd_bs2]:
+        return {"error": f"key {key} not found in captures"}
+
+    model_runner = worker.model_runner
+    vllm_config = model_runner.vllm_config
+    model = model_runner.model
+    inner = getattr(model, "model", model)
+    mlp = inner.layers[layer_idx].mlp
+    device = next(mlp.parameters()).device
+    dtype = mlp.router.weight.dtype
+
+    # Get captured inputs (they're stored as float32 CPU tensors).
+    inp_bs1_f32 = caps[fwd_bs1][key]  # [1, K]
+    inp_bs2_f32 = caps[fwd_bs2][key]  # [M_bs2, K]
+
+    # Convert to model dtype on device.
+    inp_bs1 = inp_bs1_f32.to(dtype=dtype, device=device)
+    inp_bs2 = inp_bs2_f32.to(dtype=dtype, device=device)
+    K = mlp.hidden_size
+
+    # Also build an M=1 version of just the needle row from BS=2.
+    inp_needle_only = inp_bs2[row_bs2:row_bs2 + 1].clone()
+
+    def _run(hs):
+        with set_forward_context(
+            attn_metadata=None,
+            vllm_config=vllm_config,
+            num_tokens=hs.shape[0],
+        ):
+            return mlp(hs)
+
+    with _torch.inference_mode():
+        out_bs1 = _run(inp_bs1)        # M=1
+        out_bs2 = _run(inp_bs2)        # M=M_bs2
+        out_needle = _run(inp_needle_only)  # M=1, same input as needle row
+
+    r_bs1 = out_bs1[0, :K].float()
+    r_bs2 = out_bs2[row_bs2, :K].float()
+    r_needle = out_needle[0, :K].float()
+
+    diff_main = (r_bs1 - r_bs2).abs()
+    diff_needle = (r_bs1 - r_needle).abs()
+
+    return {
+        "M_bs1": int(inp_bs1.shape[0]),
+        "M_bs2": int(inp_bs2.shape[0]),
+        "row_bs2": row_bs2,
+        # Main comparison: M=1 vs M=M_bs2
+        "bitwise_eq": bool(_torch.equal(r_bs1, r_bs2)),
+        "max_abs_diff": float(diff_main.max().item()),
+        # Control: M=1 vs M=1 (needle row only)
+        "needle_m1_bitwise_eq": bool(_torch.equal(r_bs1, r_needle)),
+        "needle_m1_max_diff": float(diff_needle.max().item()),
+        # Are the BS=1 and BS=2 needle inputs actually equal?
+        "inputs_bitwise_eq": bool(_torch.equal(
+            inp_bs1[0].float(), inp_bs2[row_bs2].float()
+        )),
+    }
+
+
 def _compare_decode_bisect(worker, fwd_bs1: int, row_bs1: int,
                            fwd_bs2: int, row_bs2: int) -> list[dict]:
     """Compare hidden states at every layer between two captures.
@@ -487,6 +568,27 @@ def test_mxfp4_marlin_moe_decode_layer_bisect(backend):
                     f"{first_diff_key} <<<",
                     flush=True,
                 )
+                # If the first divergence is at an mlp_out, replay the
+                # MoE standalone to confirm the bug is inside the layer.
+                if "_mlp_out" in first_diff_key:
+                    layer_idx = int(
+                        first_diff_key.split("_")[0][1:]
+                    )
+                    print(
+                        f"\n--- Replaying MoE at layer {layer_idx} "
+                        f"with captured inputs ---",
+                        flush=True,
+                    )
+                    replay = llm.llm_engine.collective_rpc(
+                        lambda w, li=layer_idx, f1=abs_fwd_bs1,
+                        f2=abs_fwd_bs2, r2=needle_row: (
+                            _replay_mlp_at_layer(
+                                w, li, f1, f2, r2
+                            )
+                        ),
+                    )[0]
+                    for k, v in sorted(replay.items()):
+                        print(f"  {k}: {v}", flush=True)
 
         if not found_first_diff:
             print(
