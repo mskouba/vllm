@@ -476,34 +476,55 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
         results["dup_m2_bitwise_eq"] = bool(_torch.equal(r_bs1, r_dup))
         results["dup_m2_max_diff"] = float(diff_dup.max().item())
 
-        # Test with row 0 real input + random row 1 (different routing)
-        _torch.manual_seed(42)
-        rand_row = _torch.randn(1, inp_bs1.shape[1],
-                                device=device, dtype=dtype)
-        mixed = _torch.cat([inp_bs1, rand_row], dim=0)  # [2, K]
-        out_mixed = _run_mlp(mixed)
-        r_mixed = out_mixed[0, :K].float()
-        diff_mixed = (r_bs1 - r_mixed).abs()
-        results["mixed_m2_bitwise_eq"] = bool(_torch.equal(r_bs1, r_mixed))
-        results["mixed_m2_max_diff"] = float(diff_mixed.max().item())
+        # Sweep multiple random row-1 seeds to find the failure pattern.
+        # For each seed, build M=2 = [real_row0, random_row1] and check
+        # whether the MoE output for row 0 matches the M=1 baseline.
+        sweep_results = []
+        for seed in range(20):
+            _torch.manual_seed(seed)
+            rand_row = _torch.randn(1, inp_bs1.shape[1],
+                                    device=device, dtype=dtype)
+            mixed = _torch.cat([inp_bs1, rand_row], dim=0)
+            # Get routing for the random row to see expert overlap
+            with set_forward_context(attn_metadata=None,
+                                     vllm_config=vllm_config,
+                                     num_tokens=2):
+                g_mixed = mlp.router(mixed)
+            if isinstance(g_mixed, tuple):
+                g_mixed = g_mixed[0]
+            _, ti_mixed = router.select_experts(
+                hidden_states=mixed, router_logits=g_mixed)
+            row1_experts = ti_mixed[1].tolist()
+            row0_experts = set(ti_bs1[0].tolist())
+            overlap = len(row0_experts & set(row1_experts))
 
-        # Now try with the actual BS=2 input
+            out_mixed = _run_mlp(mixed)
+            r_mixed = out_mixed[0, :K].float()
+            eq = bool(_torch.equal(r_bs1, r_mixed))
+            md = float((r_bs1 - r_mixed).abs().max().item())
+            sweep_results.append({
+                "seed": seed, "eq": eq, "max_diff": md,
+                "overlap": overlap,
+                "row1_experts": row1_experts,
+            })
+
+        n_fail = sum(1 for s in sweep_results if not s["eq"])
+        results["sweep_n_fail"] = n_fail
+        results["sweep_n_total"] = len(sweep_results)
+        # Print details of failures
+        for s in sweep_results:
+            tag = "PASS" if s["eq"] else f"FAIL diff={s['max_diff']:.4f}"
+            results[f"seed_{s['seed']:02d}"] = (
+                f"{tag} overlap={s['overlap']} "
+                f"row1_experts={s['row1_experts']}"
+            )
+
+        # Also try the actual BS=2 input
         out_bs2_full = _run_mlp(inp_bs2)
         r_bs2 = out_bs2_full[row_bs2, :K].float()
         diff_real = (r_bs1 - r_bs2).abs()
-
         results["real_m2_bitwise_eq"] = bool(_torch.equal(r_bs1, r_bs2))
         results["real_m2_max_diff"] = float(diff_real.max().item())
-
-        # Test M=3 with two random rows (different grid size again)
-        rand_row2 = _torch.randn(1, inp_bs1.shape[1],
-                                 device=device, dtype=dtype)
-        triple = _torch.cat([inp_bs1, rand_row, rand_row2], dim=0)
-        out_triple = _run_mlp(triple)
-        r_triple = out_triple[0, :K].float()
-        diff_triple = (r_bs1 - r_triple).abs()
-        results["triple_m3_bitwise_eq"] = bool(_torch.equal(r_bs1, r_triple))
-        results["triple_m3_max_diff"] = float(diff_triple.max().item())
 
     return results
 
