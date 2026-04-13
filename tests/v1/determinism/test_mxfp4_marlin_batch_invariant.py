@@ -130,6 +130,306 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
     )
 
 
+# ---------------------------------------------------------------------------
+# Diagnostic: layer-by-layer decode bisect (BS=1 vs BS=2)
+# ---------------------------------------------------------------------------
+# Finds which layer first produces different hidden states between a BS=1
+# run and a BS=2 run for the same prompt.  Hooks capture the input to each
+# layer's attention (post-input-layernorm) and the input to each layer's
+# MoE (post-attention + post-post-attention-layernorm).  The needle's row
+# in BS=2 is identified by matching the ``positions`` tensor.
+# ---------------------------------------------------------------------------
+
+
+def _install_decode_bisect_hooks(worker) -> None:
+    """Install forward-pre-hooks on every layer's attn and mlp."""
+    model = worker.model_runner.model
+    inner = getattr(model, "model", model)
+
+    worker._db = {
+        "captures": [],   # per-forward-pass list of dicts
+        "fwd": 0,         # current forward index
+        "hooks": [],      # registered hook handles
+    }
+
+    def _ensure_fwd(db, fwd):
+        while len(db["captures"]) <= fwd:
+            db["captures"].append({})
+
+    for i, layer in enumerate(inner.layers):
+
+        def _make_attn_pre(idx):
+            def hook(mod, args):
+                db = worker._db
+                _ensure_fwd(db, db["fwd"])
+                cap = db["captures"][db["fwd"]]
+                cap[f"L{idx}_attn_in"] = args[0].detach().float().cpu()
+            return hook
+
+        def _make_mlp_pre(idx):
+            def hook(mod, args):
+                db = worker._db
+                _ensure_fwd(db, db["fwd"])
+                cap = db["captures"][db["fwd"]]
+                cap[f"L{idx}_mlp_in"] = args[0].detach().float().cpu()
+            return hook
+
+        worker._db["hooks"].append(
+            layer.attn.register_forward_pre_hook(_make_attn_pre(i))
+        )
+        worker._db["hooks"].append(
+            layer.mlp.register_forward_pre_hook(_make_mlp_pre(i))
+        )
+
+    # Also capture `positions` at each forward (hook the first layer's
+    # attn to grab positions from args[1]).
+    original_attn_pre = worker._db["hooks"][-2]  # noqa: F841 — kept for clarity
+
+    def _positions_hook(mod, args):
+        db = worker._db
+        _ensure_fwd(db, db["fwd"])
+        db["captures"][db["fwd"]]["positions"] = (
+            args[1].detach().cpu().clone()
+        )
+
+    worker._db["hooks"].append(
+        inner.layers[0].attn.register_forward_pre_hook(_positions_hook)
+    )
+
+    # Bump forward counter after each full model forward.
+    def _model_post(mod, args, output):
+        worker._db["fwd"] += 1
+
+    worker._db["hooks"].append(inner.register_forward_hook(_model_post))
+
+
+def _reset_decode_bisect(worker) -> None:
+    worker._db["captures"] = []
+    worker._db["fwd"] = 0
+
+
+def _get_decode_bisect_captures(worker) -> list[dict]:
+    """Return lightweight per-forward summaries (positions + M only).
+
+    The full tensors stay on the worker; call
+    ``_compare_decode_bisect`` to do the comparison there.
+    """
+    out = []
+    for fwd_idx, cap in enumerate(worker._db["captures"]):
+        pos = cap.get("positions")
+        any_key = next(
+            (k for k in cap if k.startswith("L")), None
+        )
+        M = cap[any_key].shape[0] if any_key else 0
+        out.append({
+            "fwd": fwd_idx,
+            "M": M,
+            "positions": pos.tolist() if pos is not None else [],
+        })
+    return out
+
+
+def _compare_decode_bisect(worker, fwd_bs1: int, row_bs1: int,
+                           fwd_bs2: int, row_bs2: int) -> list[dict]:
+    """Compare hidden states at every layer between two captures.
+
+    ``fwd_bs1`` / ``row_bs1``: forward index and row in the BS=1 run.
+    ``fwd_bs2`` / ``row_bs2``: forward index and row in the BS=2 run.
+
+    The two capture sets are stored back-to-back in
+    ``worker._db["captures"]`` (BS=1 first, then BS=2 after a reset
+    offset).  The caller passes absolute indices.
+
+    Returns a list of per-layer dicts with bitwise-eq flag and max diff.
+    """
+    import torch as _torch
+
+    caps = worker._db["captures"]
+    cap1 = caps[fwd_bs1]
+    cap2 = caps[fwd_bs2]
+
+    results = []
+    # Iterate layers in order.
+    layer_keys = sorted(
+        [k for k in cap1 if k.startswith("L")],
+        key=lambda k: (int(k.split("_")[0][1:]), k.split("_", 1)[1]),
+    )
+    for key in layer_keys:
+        t1 = cap1[key]
+        t2 = cap2[key]
+        r1 = t1[row_bs1]
+        r2 = t2[row_bs2]
+        diff = (r1 - r2).abs()
+        results.append({
+            "key": key,
+            "bitwise_eq": bool(_torch.equal(r1, r2)),
+            "max_abs_diff": float(diff.max().item()),
+            "max_diff_idx": int(diff.argmax().item()),
+        })
+    return results
+
+
+def _remove_decode_bisect_hooks(worker) -> None:
+    for h in worker._db.get("hooks", []):
+        h.remove()
+    if hasattr(worker, "_db"):
+        del worker._db
+
+
+@skip_unsupported
+@pytest.mark.parametrize("backend", ["TRITON_ATTN"])
+def test_mxfp4_marlin_moe_decode_layer_bisect(backend):
+    """Diagnostic: find the first layer where BS=1 vs BS=2 diverge.
+
+    Runs the needle prompt at BS=1, then at BS=2 (needle + filler).
+    Compares the needle's hidden states at each layer boundary
+    (pre-attention and pre-MoE) during the first decode step where the
+    needle is at the same sequence position in both runs.
+
+    The needle's row in the BS=2 batch is identified by matching its
+    expected ``positions`` value (= prompt_len), fixing the row-indexing
+    bug in the earlier crossrun bisect.
+    """
+    needle_prompt = "Write one factual sentence about the moon."
+    filler_prompt = "Explain photosynthesis in simple terms for a child."
+    max_tokens = 3
+
+    sampling = SamplingParams(
+        temperature=0,
+        max_tokens=max_tokens,
+    )
+
+    llm = None
+    try:
+        llm = _make_llm(max_num_seqs=8, backend=backend)
+
+        # ---- BS=1 run ----
+        llm.llm_engine.collective_rpc(_install_decode_bisect_hooks)
+        out_bs1 = llm.generate(
+            [needle_prompt], sampling, use_tqdm=False
+        )
+        summaries_bs1 = llm.llm_engine.collective_rpc(
+            _get_decode_bisect_captures
+        )[0]
+
+        # Record BS=1 capture count so we can compute absolute indices
+        # after the BS=2 captures are appended.
+        n_fwd_bs1 = len(summaries_bs1)
+
+        # Don't reset — we'll keep BS=1 captures and append BS=2 captures
+        # so _compare_decode_bisect can access both in one call.
+
+        # ---- BS=2 run ----
+        # Reset only the forward counter; captures continue accumulating.
+        # Actually, we want to append, so just let it continue.
+        out_bs2 = llm.generate(
+            [needle_prompt, filler_prompt], sampling, use_tqdm=False
+        )
+        summaries_bs2_raw = llm.llm_engine.collective_rpc(
+            _get_decode_bisect_captures
+        )[0]
+        # BS=2 summaries include BS=1 captures at the front; slice them off.
+        summaries_bs2 = summaries_bs2_raw[n_fwd_bs1:]
+
+        llm.llm_engine.collective_rpc(_remove_decode_bisect_hooks)
+
+        # ---- Identify decode steps to compare ----
+        # In BS=1, the needle is the only sequence.  Find the first
+        # decode forward (M=1).
+        needle_prompt_len = len(
+            out_bs1[0].prompt_token_ids
+        )
+        print(
+            f"needle prompt_len={needle_prompt_len}",
+            flush=True,
+        )
+
+        # BS=1 decode forwards: M=1, position = prompt_len + decode_step
+        bs1_decode_fwds: list[tuple[int, int]] = []  # (abs_fwd_idx, position)
+        for s in summaries_bs1:
+            if s["M"] == 1:
+                pos = s["positions"][0] if s["positions"] else -1
+                bs1_decode_fwds.append((s["fwd"], pos))
+                print(
+                    f"  BS=1 decode fwd={s['fwd']} pos={pos}",
+                    flush=True,
+                )
+
+        # BS=2 decode forwards: M=2 (or more if mixed with prefill).
+        # Find the needle's row by matching position = prompt_len + k.
+        bs2_decode_fwds: list[tuple[int, int, int]] = []  # (abs, pos, row)
+        for s in summaries_bs2:
+            positions = s["positions"]
+            for row_idx, pos in enumerate(positions):
+                # Match the needle's expected position at each decode step.
+                if pos >= needle_prompt_len and s["M"] <= 8:
+                    bs2_decode_fwds.append(
+                        (s["fwd"], pos, row_idx)
+                    )
+                    print(
+                        f"  BS=2 decode fwd={s['fwd']} M={s['M']} "
+                        f"needle_row={row_idx} pos={pos}",
+                        flush=True,
+                    )
+                    break  # one match per forward
+
+        # ---- Compare matching decode steps ----
+        # Match by position value (= same point in the sequence).
+        bs1_by_pos = {pos: fwd for fwd, pos in bs1_decode_fwds}
+
+        found_first_diff = False
+        for abs_fwd_bs2, pos, needle_row in bs2_decode_fwds:
+            abs_fwd_bs1 = bs1_by_pos.get(pos)
+            if abs_fwd_bs1 is None:
+                print(
+                    f"  pos={pos}: no matching BS=1 decode step, skipping",
+                    flush=True,
+                )
+                continue
+
+            print(
+                f"\n=== Comparing pos={pos}  "
+                f"BS=1 fwd={abs_fwd_bs1} row=0  vs  "
+                f"BS=2 fwd={abs_fwd_bs2} row={needle_row} ===",
+                flush=True,
+            )
+
+            layer_results = llm.llm_engine.collective_rpc(
+                lambda w, f1=abs_fwd_bs1, f2=abs_fwd_bs2, r2=needle_row: (
+                    _compare_decode_bisect(w, f1, 0, f2, r2)
+                ),
+            )[0]
+
+            first_diff_key = None
+            for lr in layer_results:
+                tag = "EQ" if lr["bitwise_eq"] else (
+                    f"DIFF max={lr['max_abs_diff']:.4e} "
+                    f"idx={lr['max_diff_idx']}"
+                )
+                print(f"  {lr['key']}: {tag}", flush=True)
+                if not lr["bitwise_eq"] and first_diff_key is None:
+                    first_diff_key = lr["key"]
+
+            if first_diff_key is not None and not found_first_diff:
+                found_first_diff = True
+                print(
+                    f"\n>>> First divergence at pos={pos}: "
+                    f"{first_diff_key} <<<",
+                    flush=True,
+                )
+
+        if not found_first_diff:
+            print(
+                "\nAll layers bitwise-equal at all matched decode steps!",
+                flush=True,
+            )
+
+    finally:
+        if llm is not None:
+            with contextlib.suppress(Exception):
+                llm.shutdown()
+
+
 @skip_unsupported
 @pytest.mark.parametrize("backend", ["TRITON_ATTN"])
 def test_mxfp4_marlin_moe_unit_invariance(backend):
