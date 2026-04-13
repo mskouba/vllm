@@ -203,11 +203,23 @@ def _install_decode_bisect_hooks(worker) -> None:
                 )
             return hook
 
+        def _make_mlp_post(idx):
+            def hook(mod, args, output):
+                if not db["captures"]:
+                    return
+                db["captures"][-1][f"L{idx}_mlp_out"] = (
+                    output.detach().float().cpu()
+                )
+            return hook
+
         db["hooks"].append(
             layer.attn.register_forward_pre_hook(_make_attn_pre(i))
         )
         db["hooks"].append(
             layer.mlp.register_forward_pre_hook(_make_mlp_pre(i))
+        )
+        db["hooks"].append(
+            layer.mlp.register_forward_hook(_make_mlp_post(i))
         )
 
     # Hook the final RMSNorm (input to lm_head) to capture the model's
