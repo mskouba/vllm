@@ -142,36 +142,45 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
 
 
 def _install_decode_bisect_hooks(worker) -> None:
-    """Install forward-pre-hooks on every layer's attn and mlp."""
+    """Install forward-pre-hooks on every layer's attn and mlp.
+
+    Forward-pass boundaries are detected by watching layer 0's attn hook
+    (the first hook to fire each forward).  A model-level post-hook is
+    NOT used because ``@support_torch_compile`` can wrap the model's
+    ``forward`` and silently prevent it from firing.
+    """
     model = worker.model_runner.model
     inner = getattr(model, "model", model)
 
     worker._db = {
         "captures": [],   # per-forward-pass list of dicts
-        "fwd": 0,         # current forward index
         "hooks": [],      # registered hook handles
     }
-
-    def _ensure_fwd(db, fwd):
-        while len(db["captures"]) <= fwd:
-            db["captures"].append({})
 
     for i, layer in enumerate(inner.layers):
 
         def _make_attn_pre(idx):
             def hook(mod, args):
                 db = worker._db
-                _ensure_fwd(db, db["fwd"])
-                cap = db["captures"][db["fwd"]]
-                cap[f"L{idx}_attn_in"] = args[0].detach().float().cpu()
+                if idx == 0:
+                    # Layer 0 attn is the first hook to fire each
+                    # forward — start a new capture dict.
+                    db["captures"].append({})
+                    # Also grab ``positions`` (arg 1 of OAIAttention).
+                    db["captures"][-1]["positions"] = (
+                        args[1].detach().cpu().clone()
+                    )
+                db["captures"][-1][f"L{idx}_attn_in"] = (
+                    args[0].detach().float().cpu()
+                )
             return hook
 
         def _make_mlp_pre(idx):
             def hook(mod, args):
                 db = worker._db
-                _ensure_fwd(db, db["fwd"])
-                cap = db["captures"][db["fwd"]]
-                cap[f"L{idx}_mlp_in"] = args[0].detach().float().cpu()
+                db["captures"][-1][f"L{idx}_mlp_in"] = (
+                    args[0].detach().float().cpu()
+                )
             return hook
 
         worker._db["hooks"].append(
@@ -181,31 +190,9 @@ def _install_decode_bisect_hooks(worker) -> None:
             layer.mlp.register_forward_pre_hook(_make_mlp_pre(i))
         )
 
-    # Also capture `positions` at each forward (hook the first layer's
-    # attn to grab positions from args[1]).
-    original_attn_pre = worker._db["hooks"][-2]  # noqa: F841 — kept for clarity
-
-    def _positions_hook(mod, args):
-        db = worker._db
-        _ensure_fwd(db, db["fwd"])
-        db["captures"][db["fwd"]]["positions"] = (
-            args[1].detach().cpu().clone()
-        )
-
-    worker._db["hooks"].append(
-        inner.layers[0].attn.register_forward_pre_hook(_positions_hook)
-    )
-
-    # Bump forward counter after each full model forward.
-    def _model_post(mod, args, output):
-        worker._db["fwd"] += 1
-
-    worker._db["hooks"].append(inner.register_forward_hook(_model_post))
-
 
 def _reset_decode_bisect(worker) -> None:
     worker._db["captures"] = []
-    worker._db["fwd"] = 0
 
 
 def _get_decode_bisect_captures(worker) -> list[dict]:
@@ -334,42 +321,53 @@ def test_mxfp4_marlin_moe_decode_layer_bisect(backend):
         llm.llm_engine.collective_rpc(_remove_decode_bisect_hooks)
 
         # ---- Identify decode steps to compare ----
-        # In BS=1, the needle is the only sequence.  Find the first
-        # decode forward (M=1).
         needle_prompt_len = len(
             out_bs1[0].prompt_token_ids
         )
         print(
-            f"needle prompt_len={needle_prompt_len}",
+            f"needle prompt_len={needle_prompt_len}  "
+            f"BS=1 forwards={n_fwd_bs1}  "
+            f"BS=2 forwards={len(summaries_bs2)}",
             flush=True,
         )
 
-        # BS=1 decode forwards: M=1, position = prompt_len + decode_step
+        # Dump ALL forward summaries so we can see the schedule.
+        print("--- BS=1 forward schedule ---", flush=True)
+        for s in summaries_bs1:
+            pos_str = ",".join(str(p) for p in s["positions"][:8])
+            if len(s["positions"]) > 8:
+                pos_str += f"...({len(s['positions'])} total)"
+            print(
+                f"  fwd={s['fwd']} M={s['M']} positions=[{pos_str}]",
+                flush=True,
+            )
+        print("--- BS=2 forward schedule ---", flush=True)
+        for s in summaries_bs2:
+            pos_str = ",".join(str(p) for p in s["positions"][:8])
+            if len(s["positions"]) > 8:
+                pos_str += f"...({len(s['positions'])} total)"
+            print(
+                f"  fwd={s['fwd']} M={s['M']} positions=[{pos_str}]",
+                flush=True,
+            )
+
+        # BS=1 decode forwards: M=1, position >= prompt_len
         bs1_decode_fwds: list[tuple[int, int]] = []  # (abs_fwd_idx, position)
         for s in summaries_bs1:
             if s["M"] == 1:
                 pos = s["positions"][0] if s["positions"] else -1
-                bs1_decode_fwds.append((s["fwd"], pos))
-                print(
-                    f"  BS=1 decode fwd={s['fwd']} pos={pos}",
-                    flush=True,
-                )
+                if pos >= needle_prompt_len:
+                    bs1_decode_fwds.append((s["fwd"], pos))
 
-        # BS=2 decode forwards: M=2 (or more if mixed with prefill).
-        # Find the needle's row by matching position = prompt_len + k.
+        # BS=2 decode forwards: find the needle's row by matching
+        # position >= needle_prompt_len.
         bs2_decode_fwds: list[tuple[int, int, int]] = []  # (abs, pos, row)
         for s in summaries_bs2:
             positions = s["positions"]
             for row_idx, pos in enumerate(positions):
-                # Match the needle's expected position at each decode step.
-                if pos >= needle_prompt_len and s["M"] <= 8:
+                if pos >= needle_prompt_len:
                     bs2_decode_fwds.append(
                         (s["fwd"], pos, row_idx)
-                    )
-                    print(
-                        f"  BS=2 decode fwd={s['fwd']} M={s['M']} "
-                        f"needle_row={row_idx} pos={pos}",
-                        flush=True,
                     )
                     break  # one match per forward
 
