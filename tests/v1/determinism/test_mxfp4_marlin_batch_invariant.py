@@ -521,13 +521,20 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
         n_fail = sum(1 for s in sweep_results if not s["eq"])
         results["sweep_n_fail"] = n_fail
         results["sweep_n_total"] = len(sweep_results)
-        # Print details of failures
+        # Collect failure details for printing
+        fail_details = []
         for s in sweep_results:
-            tag = "PASS" if s["eq"] else f"FAIL diff={s['max_diff']:.4f}"
-            results[f"seed_{s['seed']:02d}"] = (
-                f"{tag} overlap={s['overlap']} "
-                f"row1_experts={s['row1_experts']}"
-            )
+            if not s["eq"]:
+                fail_details.append(
+                    f"seed={s['seed']:02d} diff={s['max_diff']:.4f} "
+                    f"argmax={s['argmax']} "
+                    f"val_bs1={s['val_bs1']:.6f} "
+                    f"val_mixed={s['val_mixed']:.6f} "
+                    f"n_diff_elems={s['n_diff_elems']} "
+                    f"overlap={s['overlap']} "
+                    f"row1_experts={s['row1_experts']}"
+                )
+        results["sweep_failures"] = fail_details
 
         # Also try the actual BS=2 input
         out_bs2_full = _run_mlp(inp_bs2)
