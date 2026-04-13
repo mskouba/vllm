@@ -141,6 +141,24 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
 # ---------------------------------------------------------------------------
 
 
+def _get_bisect_db(worker):
+    """Get or create the bisect state dict, stored on the model object.
+
+    We store state on the model (a persistent nn.Module in the worker
+    subprocess) rather than on the worker, because the worker object
+    handed to each ``collective_rpc`` call may be a fresh wrapper that
+    does not carry attributes from previous calls.
+    """
+    model = worker.model_runner.model
+    inner = getattr(model, "model", model)
+    if not hasattr(inner, "_bisect_db"):
+        inner._bisect_db = {
+            "captures": [],
+            "hooks": [],
+        }
+    return inner, inner._bisect_db
+
+
 def _install_decode_bisect_hooks(worker) -> None:
     """Install forward-pre-hooks on every layer's attn and mlp.
 
@@ -149,19 +167,18 @@ def _install_decode_bisect_hooks(worker) -> None:
     NOT used because ``@support_torch_compile`` can wrap the model's
     ``forward`` and silently prevent it from firing.
     """
-    model = worker.model_runner.model
-    inner = getattr(model, "model", model)
+    inner, db = _get_bisect_db(worker)
 
-    worker._db = {
-        "captures": [],   # per-forward-pass list of dicts
-        "hooks": [],      # registered hook handles
-    }
+    # Clear any prior state.
+    for h in db["hooks"]:
+        h.remove()
+    db["captures"] = []
+    db["hooks"] = []
 
     for i, layer in enumerate(inner.layers):
 
         def _make_attn_pre(idx):
             def hook(mod, args):
-                db = worker._db
                 if idx == 0:
                     # Layer 0 attn is the first hook to fire each
                     # forward — start a new capture dict.
@@ -177,22 +194,22 @@ def _install_decode_bisect_hooks(worker) -> None:
 
         def _make_mlp_pre(idx):
             def hook(mod, args):
-                db = worker._db
                 db["captures"][-1][f"L{idx}_mlp_in"] = (
                     args[0].detach().float().cpu()
                 )
             return hook
 
-        worker._db["hooks"].append(
+        db["hooks"].append(
             layer.attn.register_forward_pre_hook(_make_attn_pre(i))
         )
-        worker._db["hooks"].append(
+        db["hooks"].append(
             layer.mlp.register_forward_pre_hook(_make_mlp_pre(i))
         )
 
 
 def _reset_decode_bisect(worker) -> None:
-    worker._db["captures"] = []
+    _, db = _get_bisect_db(worker)
+    db["captures"] = []
 
 
 def _get_decode_bisect_captures(worker) -> list[dict]:
@@ -201,8 +218,9 @@ def _get_decode_bisect_captures(worker) -> list[dict]:
     The full tensors stay on the worker; call
     ``_compare_decode_bisect`` to do the comparison there.
     """
+    _, db = _get_bisect_db(worker)
     out = []
-    for fwd_idx, cap in enumerate(worker._db["captures"]):
+    for fwd_idx, cap in enumerate(db["captures"]):
         pos = cap.get("positions")
         any_key = next(
             (k for k in cap if k.startswith("L")), None
@@ -220,18 +238,12 @@ def _compare_decode_bisect(worker, fwd_bs1: int, row_bs1: int,
                            fwd_bs2: int, row_bs2: int) -> list[dict]:
     """Compare hidden states at every layer between two captures.
 
-    ``fwd_bs1`` / ``row_bs1``: forward index and row in the BS=1 run.
-    ``fwd_bs2`` / ``row_bs2``: forward index and row in the BS=2 run.
-
-    The two capture sets are stored back-to-back in
-    ``worker._db["captures"]`` (BS=1 first, then BS=2 after a reset
-    offset).  The caller passes absolute indices.
-
     Returns a list of per-layer dicts with bitwise-eq flag and max diff.
     """
     import torch as _torch
 
-    caps = worker._db["captures"]
+    _, db = _get_bisect_db(worker)
+    caps = db["captures"]
     cap1 = caps[fwd_bs1]
     cap2 = caps[fwd_bs2]
 
@@ -257,10 +269,13 @@ def _compare_decode_bisect(worker, fwd_bs1: int, row_bs1: int,
 
 
 def _remove_decode_bisect_hooks(worker) -> None:
-    for h in worker._db.get("hooks", []):
+    inner, db = _get_bisect_db(worker)
+    for h in db.get("hooks", []):
         h.remove()
-    if hasattr(worker, "_db"):
-        del worker._db
+    db["captures"] = []
+    db["hooks"] = []
+    if hasattr(inner, "_bisect_db"):
+        del inner._bisect_db
 
 
 @skip_unsupported
