@@ -230,9 +230,11 @@ def _get_decode_bisect_captures(worker) -> list[dict]:
             (k for k in cap if k.startswith("L")), None
         )
         M = cap[any_key].shape[0] if any_key else 0
+        n_keys = sum(1 for k in cap if k.startswith("L"))
         out.append({
             "fwd": fwd_idx,
             "M": M,
+            "n_keys": n_keys,
             "positions": pos.tolist() if pos is not None else [],
         })
     return out
@@ -243,11 +245,22 @@ def _compare_decode_bisect(worker, fwd_bs1: int, row_bs1: int,
     """Compare hidden states at every layer between two captures.
 
     Returns a list of per-layer dicts with bitwise-eq flag and max diff.
+    If an index is out of range, returns a single-element error list.
     """
     import torch as _torch
 
     _, db = _get_bisect_db(worker)
     caps = db["captures"]
+    n_caps = len(caps)
+    if fwd_bs1 >= n_caps or fwd_bs2 >= n_caps:
+        return [{
+            "key": "__ERROR__",
+            "bitwise_eq": False,
+            "max_abs_diff": -1.0,
+            "max_diff_idx": -1,
+            "error": (f"index out of range: fwd_bs1={fwd_bs1}, "
+                      f"fwd_bs2={fwd_bs2}, n_caps={n_caps}"),
+        }]
     cap1 = caps[fwd_bs1]
     cap2 = caps[fwd_bs2]
 
@@ -357,7 +370,8 @@ def test_mxfp4_marlin_moe_decode_layer_bisect(backend):
             if len(s["positions"]) > 8:
                 pos_str += f"...({len(s['positions'])} total)"
             print(
-                f"  fwd={s['fwd']} M={s['M']} positions=[{pos_str}]",
+                f"  fwd={s['fwd']} M={s['M']} "
+                f"n_keys={s['n_keys']} positions=[{pos_str}]",
                 flush=True,
             )
         print("--- BS=2 forward schedule ---", flush=True)
@@ -366,22 +380,25 @@ def test_mxfp4_marlin_moe_decode_layer_bisect(backend):
             if len(s["positions"]) > 8:
                 pos_str += f"...({len(s['positions'])} total)"
             print(
-                f"  fwd={s['fwd']} M={s['M']} positions=[{pos_str}]",
+                f"  fwd={s['fwd']} M={s['M']} "
+                f"n_keys={s['n_keys']} positions=[{pos_str}]",
                 flush=True,
             )
 
-        # BS=1 decode forwards: M=1, position >= prompt_len
+        # BS=1 decode forwards: M=1, position >= prompt_len, complete
         bs1_decode_fwds: list[tuple[int, int]] = []  # (abs_fwd_idx, position)
         for s in summaries_bs1:
-            if s["M"] == 1:
+            if s["M"] == 1 and s["n_keys"] > 0:
                 pos = s["positions"][0] if s["positions"] else -1
                 if pos >= needle_prompt_len:
                     bs1_decode_fwds.append((s["fwd"], pos))
 
         # BS=2 decode forwards: find the needle's row by matching
-        # position >= needle_prompt_len.
+        # position >= needle_prompt_len. Skip incomplete captures.
         bs2_decode_fwds: list[tuple[int, int, int]] = []  # (abs, pos, row)
         for s in summaries_bs2:
+            if s["n_keys"] == 0:
+                continue  # skip incomplete warmup forwards
             positions = s["positions"]
             for row_idx, pos in enumerate(positions):
                 if pos >= needle_prompt_len:
@@ -416,6 +433,14 @@ def test_mxfp4_marlin_moe_decode_layer_bisect(backend):
                     _compare_decode_bisect(w, f1, 0, f2, r2)
                 ),
             )[0]
+
+            # Check for error sentinel from bounds-checking.
+            if layer_results and layer_results[0].get("error"):
+                print(
+                    f"  ERROR: {layer_results[0]['error']}",
+                    flush=True,
+                )
+                continue
 
             first_diff_key = None
             for lr in layer_results:
