@@ -476,67 +476,170 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
         results["dup_m2_bitwise_eq"] = bool(_torch.equal(r_bs1, r_dup))
         results["dup_m2_max_diff"] = float(diff_dup.max().item())
 
-        # Sweep multiple random row-1 seeds to find the failure pattern.
-        # For each seed, build M=2 = [real_row0, random_row1] and check
-        # whether the MoE output for row 0 matches the M=1 baseline.
-        sweep_results = []
-        for seed in range(20):
-            _torch.manual_seed(seed)
-            rand_row = _torch.randn(1, inp_bs1.shape[1],
-                                    device=device, dtype=dtype)
-            mixed = _torch.cat([inp_bs1, rand_row], dim=0)
-            # Get routing for the random row to see expert overlap
-            with set_forward_context(attn_metadata=None,
-                                     vllm_config=vllm_config,
-                                     num_tokens=2):
-                g_mixed = mlp.router(mixed)
-            if isinstance(g_mixed, tuple):
-                g_mixed = g_mixed[0]
-            _, ti_mixed = router.select_experts(
-                hidden_states=mixed, router_logits=g_mixed)
-            row1_experts = ti_mixed[1].tolist()
-            row0_experts = set(ti_bs1[0].tolist())
-            overlap = len(row0_experts & set(row1_experts))
+        # ---- Step 5: Localize which GEMM diverges ----
+        # Use seed 6 (known to fail) to build a mixed M=2 input,
+        # then call fused_marlin_moe directly so we can inspect
+        # intermediates: GEMM1 output, activation output, GEMM2 output
+        # (pre-moe_sum).
+        _torch.manual_seed(6)
+        rand_row = _torch.randn(1, inp_bs1.shape[1],
+                                device=device, dtype=dtype)
+        mixed = _torch.cat([inp_bs1, rand_row], dim=0)
 
-            out_mixed = _run_mlp(mixed)
-            r_mixed = out_mixed[0, :K].float()
-            diff = (r_bs1 - r_mixed).abs()
-            eq = bool(_torch.equal(r_bs1, r_mixed))
-            md = float(diff.max().item())
-            argmax = int(diff.argmax().item()) if md > 0 else -1
-            # For failures, also get the actual values at the diff point
-            val_bs1 = float(r_bs1[argmax].item()) if argmax >= 0 else 0
-            val_mixed = float(r_mixed[argmax].item()) if argmax >= 0 else 0
-            n_diff_elems = int((diff > 0).sum().item())
-            sweep_results.append({
-                "seed": seed, "eq": eq, "max_diff": md,
-                "overlap": overlap,
-                "row1_experts": row1_experts,
-                "argmax": argmax,
-                "val_bs1": val_bs1,
-                "val_mixed": val_mixed,
-                "n_diff_elems": n_diff_elems,
-            })
+        # Get routing for mixed
+        with set_forward_context(attn_metadata=None,
+                                 vllm_config=vllm_config,
+                                 num_tokens=2):
+            g_mixed = mlp.router(mixed)
+        if isinstance(g_mixed, tuple):
+            g_mixed = g_mixed[0]
+        tw_mixed, ti_mixed = router.select_experts(
+            hidden_states=mixed, router_logits=g_mixed)
 
-        n_fail = sum(1 for s in sweep_results if not s["eq"])
-        results["sweep_n_fail"] = n_fail
-        results["sweep_n_total"] = len(sweep_results)
-        # Collect failure details for printing
-        fail_details = []
-        for s in sweep_results:
-            if not s["eq"]:
-                fail_details.append(
-                    f"seed={s['seed']:02d} diff={s['max_diff']:.4f} "
-                    f"argmax={s['argmax']} "
-                    f"val_bs1={s['val_bs1']:.6f} "
-                    f"val_mixed={s['val_mixed']:.6f} "
-                    f"n_diff_elems={s['n_diff_elems']} "
-                    f"overlap={s['overlap']} "
-                    f"row1_experts={s['row1_experts']}"
-                )
-        results["sweep_failures"] = fail_details
+        # Extract Marlin weights from the experts module
+        from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
+            _fused_marlin_moe,
+            marlin_moe_intermediate_size,
+        )
+        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+            moe_align_block_size as _moe_align,
+        )
+        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+            marlin_make_workspace_new,
+        )
+        from vllm.scalar_type import ScalarType, scalar_types
 
-        # Also try the actual BS=2 input
+        # Dig out the Marlin weights.
+        # Weight tensors (w13_weight, w2_weight) are registered on the
+        # FusedMoE module (mlp).  Scales and global_scales live on the
+        # MarlinExperts sub-module (fused_experts).
+        fused_experts = getattr(experts_mod, 'fused_experts', experts_mod)
+        w1 = getattr(mlp, 'w13_weight', None)
+        w2 = getattr(mlp, 'w2_weight', None)
+        w1_scale = getattr(fused_experts, 'w1_scale', None)
+        w2_scale = getattr(fused_experts, 'w2_scale', None)
+        gs1 = getattr(fused_experts, 'g1_alphas', None)
+        gs2 = getattr(fused_experts, 'g2_alphas', None)
+
+        # Fallback: try layer-level names
+        if w1 is None:
+            w1 = getattr(experts_mod, 'w13_weight', None)
+        if w2 is None:
+            w2 = getattr(experts_mod, 'w2_weight', None)
+        if w1_scale is None:
+            w1_scale = getattr(mlp, 'w13_weight_scale', None)
+        if w2_scale is None:
+            w2_scale = getattr(mlp, 'w2_weight_scale', None)
+
+        results["w1_found"] = w1 is not None
+        results["w2_found"] = w2 is not None
+
+        if w1 is not None and w2 is not None:
+            N_expert = marlin_moe_intermediate_size(w1, w2)
+            quant_type = scalar_types.float4_e2m1f
+            topk_val = ti_bs1.shape[1]
+            block_size_m = 64
+
+            results["gemm_dims"] = {
+                "K": K,
+                "N_expert": N_expert,
+                "w1_shape": list(w1.shape),
+                "w2_shape": list(w2.shape),
+                "w1_scale_shape": list(w1_scale.shape) if w1_scale is not None else None,
+            }
+
+            # Call fused_marlin_moe for BS=1
+            stids_1, eids_1, ntpp_1 = _moe_align(
+                ti_bs1, block_size_m, global_num_experts, None)
+            workspace = marlin_make_workspace_new(device, 4)
+
+            from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
+                MoEActivation,
+                apply_moe_activation,
+            )
+
+            moe_out_bs1 = _fused_marlin_moe(
+                hidden_states=inp_bs1,
+                w1=w1, w2=w2,
+                bias1=None, bias2=None,
+                w1_scale=w1_scale, w2_scale=w2_scale,
+                topk_weights=tw_bs1,
+                num_topk=topk_val,
+                quant_type=quant_type,
+                apply_router_weight_on_input=False,
+                expert_map=None,
+                block_size_m=block_size_m,
+                sorted_token_ids=stids_1,
+                expert_ids=eids_1,
+                num_tokens_post_padded=ntpp_1,
+                activation=MoEActivation.SILU,
+                activation_func=apply_moe_activation,
+                global_scale1=gs1,
+                global_scale2=gs2,
+                workspace=workspace,
+            )
+            # moe_out shape: [M*topk, K]
+            results["moe_out_bs1_shape"] = list(moe_out_bs1.shape)
+
+            # Call fused_marlin_moe for mixed M=2
+            stids_m, eids_m, ntpp_m = _moe_align(
+                ti_mixed, block_size_m, global_num_experts, None)
+
+            moe_out_mixed = _fused_marlin_moe(
+                hidden_states=mixed,
+                w1=w1, w2=w2,
+                bias1=None, bias2=None,
+                w1_scale=w1_scale, w2_scale=w2_scale,
+                topk_weights=tw_mixed,
+                num_topk=topk_val,
+                quant_type=quant_type,
+                apply_router_weight_on_input=False,
+                expert_map=None,
+                block_size_m=block_size_m,
+                sorted_token_ids=stids_m,
+                expert_ids=eids_m,
+                num_tokens_post_padded=ntpp_m,
+                activation=MoEActivation.SILU,
+                activation_func=apply_moe_activation,
+                global_scale1=gs1,
+                global_scale2=gs2,
+                workspace=workspace,
+            )
+            results["moe_out_mixed_shape"] = list(moe_out_mixed.shape)
+
+            # Compare pre-sum: each topk slot separately
+            slot_diffs = []
+            for s in range(topk_val):
+                bs1_slot = moe_out_bs1[s, :].float()
+                mix_slot = moe_out_mixed[s, :].float()
+                diff_slot = (bs1_slot - mix_slot).abs()
+                eq_slot = bool(_torch.equal(bs1_slot, mix_slot))
+                md_slot = float(diff_slot.max().item())
+                n_diff = int((diff_slot > 0).sum().item())
+                argmax_slot = int(diff_slot.argmax().item()) if md_slot > 0 else -1
+                slot_diffs.append({
+                    "slot": s,
+                    "eq": eq_slot,
+                    "max_diff": md_slot,
+                    "n_diff": n_diff,
+                    "argmax": argmax_slot,
+                    "expert_bs1": int(ti_bs1[0, s].item()),
+                    "expert_mixed": int(ti_mixed[0, s].item()),
+                })
+            results["pre_sum_slot_diffs"] = slot_diffs
+
+            # Also compare the SUM (moe_sum equivalent)
+            sum_bs1 = moe_out_bs1[:topk_val, :K].float().sum(dim=0)
+            sum_mixed = moe_out_mixed[:topk_val, :K].float().sum(dim=0)
+            diff_sum = (sum_bs1 - sum_mixed).abs()
+            results["sum_eq"] = bool(_torch.equal(sum_bs1, sum_mixed))
+            results["sum_max_diff"] = float(diff_sum.max().item())
+            if diff_sum.max().item() > 0:
+                diff_indices = _torch.nonzero(diff_sum > 0).squeeze(-1).tolist()
+                results["sum_diff_indices"] = diff_indices[:32]
+                results["sum_argmax"] = int(diff_sum.argmax().item())
+
+        # Also try the actual BS=2 input through the full MLP
         out_bs2_full = _run_mlp(inp_bs2)
         r_bs2 = out_bs2_full[row_bs2, :K].float()
         diff_real = (r_bs1 - r_bs2).abs()
