@@ -410,22 +410,12 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
             (g_bs1[0].float() - g_bs2[row_bs2].float()).abs().max().item())
 
         # ---- Step 2: TopK routing ----
-        # Get the FusedMoE module (mlp.experts) to access its router
         experts_mod = mlp.experts
-        # Use the router's select_experts if available
-        if hasattr(experts_mod, '_moe_runner') and hasattr(
-                experts_mod._moe_runner, 'router'):
-            router = experts_mod._moe_runner.router
-            tw_bs1, ti_bs1 = router.select_experts(
-                hidden_states=inp_bs1, router_logits=g_bs1)
-            tw_bs2, ti_bs2 = router.select_experts(
-                hidden_states=inp_bs2, router_logits=g_bs2)
-        else:
-            # Fallback: use the module's select_and_reduce
-            tw_bs1, ti_bs1 = experts_mod.select_and_reduce(
-                router_logits=g_bs1)
-            tw_bs2, ti_bs2 = experts_mod.select_and_reduce(
-                router_logits=g_bs2)
+        router = experts_mod.router
+        tw_bs1, ti_bs1 = router.select_experts(
+            hidden_states=inp_bs1, router_logits=g_bs1)
+        tw_bs2, ti_bs2 = router.select_experts(
+            hidden_states=inp_bs2, router_logits=g_bs2)
 
         results["topk_ids_eq"] = bool(
             _torch.equal(ti_bs1[0], ti_bs2[row_bs2]))
@@ -444,18 +434,7 @@ def _decomposed_replay_mlp_at_layer(worker, layer_idx: int,
         )
         block_size_m = 64
         E = ti_bs1.shape[1]  # This is topk, not num_experts
-        # Get the actual num_experts from the weights
-        qm = experts_mod._moe_runner.quant_method
-        if hasattr(qm, 'fused_experts'):
-            fe = qm.fused_experts
-        else:
-            fe = qm
-        # Try to get global_num_experts
-        global_num_experts = -1
-        if hasattr(fe, 'moe_config'):
-            global_num_experts = fe.moe_config.num_experts
-        elif hasattr(experts_mod, 'num_experts'):
-            global_num_experts = experts_mod.num_experts
+        global_num_experts = experts_mod.global_num_experts
 
         stids_bs1, eids_bs1, ntpp_bs1 = moe_align_block_size(
             ti_bs1, block_size_m, global_num_experts, None)
