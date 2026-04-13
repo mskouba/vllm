@@ -350,7 +350,9 @@ def test_mxfp4_marlin_moe_decode_layer_bisect(backend):
         # BS=2 summaries include BS=1 captures at the front; slice them off.
         summaries_bs2 = summaries_bs2_raw[n_fwd_bs1:]
 
-        llm.llm_engine.collective_rpc(_remove_decode_bisect_hooks)
+        # NOTE: Do NOT remove hooks/captures here — _compare_decode_bisect
+        # needs the captures that live on the worker.  Clean up after all
+        # comparisons are done (see below).
 
         # ---- Identify decode steps to compare ----
         needle_prompt_len = len(
@@ -465,6 +467,9 @@ def test_mxfp4_marlin_moe_decode_layer_bisect(backend):
                 "\nAll layers bitwise-equal at all matched decode steps!",
                 flush=True,
             )
+
+        # Clean up hooks and captures now that comparisons are done.
+        llm.llm_engine.collective_rpc(_remove_decode_bisect_hooks)
 
     finally:
         if llm is not None:
