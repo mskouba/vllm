@@ -6,117 +6,9 @@ from collections.abc import Callable
 
 import torch
 
-import os
-import sys
-
 import vllm._custom_ops as ops
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-
-_MARLIN_MOE_TRACE = os.environ.get("VLLM_MARLIN_MOE_TRACE", "0") == "1"
-_MARLIN_MOE_TRACE_COUNTER = 0
-
-
-def _marlin_moe_fp(t: torch.Tensor | None) -> str:
-    """Stable, cheap fingerprint of a tensor for cross-run comparison.
-
-    Casts to float32 on device, computes (sum, sum_of_squares, min, max)
-    with deterministic reduction, and returns a short string. Intended
-    only for tracing under VLLM_MARLIN_MOE_TRACE=1.
-    """
-    if t is None:
-        return "None"
-    if t.numel() == 0:
-        return f"empty[{tuple(t.shape)}]"
-    x = t.detach().to(torch.float64)
-    s = float(x.sum().item())
-    ss = float((x * x).sum().item())
-    mn = float(x.min().item())
-    mx = float(x.max().item())
-    return (
-        f"shape={tuple(t.shape)} dtype={t.dtype} "
-        f"sum={s:+.12e} sumsq={ss:.12e} min={mn:+.6e} max={mx:+.6e}"
-    )
-
-
-def _marlin_moe_halves_match(t: torch.Tensor | None) -> str:
-    """For same-content BS=2 diagnostics: split row dim in half and test
-    bitwise equality. Returns a short string used in trace lines.
-
-    If ``t`` has an even number of rows, compares ``t[:M//2]`` against
-    ``t[M//2:]``. Prints either ``halves=EQUAL`` or the largest abs diff
-    and the first diverging row index. Otherwise returns ``halves=odd``.
-    """
-    if t is None:
-        return "halves=None"
-    if t.dim() == 0 or t.size(0) < 2 or (t.size(0) % 2) != 0:
-        return f"halves=odd(M={0 if t.dim() == 0 else t.size(0)})"
-    half = t.size(0) // 2
-    a = t[:half]
-    b = t[half:]
-    if a.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
-        diff = (a.to(torch.float64) - b.to(torch.float64)).abs()
-        max_diff = float(diff.max().item())
-        if max_diff == 0.0:
-            return f"halves=EQUAL(M/2={half})"
-        # First row where any element differs
-        row_has_diff = (diff > 0).any(dim=tuple(range(1, diff.dim()))) \
-            if diff.dim() > 1 else (diff > 0)
-        first_bad = int(row_has_diff.nonzero(as_tuple=False)[0].item())
-        return (
-            f"halves=DIFF(M/2={half}) max_abs_diff={max_diff:.6e} "
-            f"first_bad_row={first_bad}"
-        )
-    else:
-        # Integer / index tensors: exact equality
-        equal = bool((a == b).all().item())
-        return f"halves={'EQUAL' if equal else 'DIFF'}(int,M/2={half})"
-
-
-def _marlin_moe_rows_eq(t: torch.Tensor | None, max_rows: int = 16) -> str:
-    """Per-row pairwise equality probe for small M (decode case).
-
-    For tensors with M <= ``max_rows``, fingerprints each row independently
-    and reports which rows are bitwise equal to row 0. This catches
-    intra-batch position-dependent divergence at decode time, where the
-    halves-split probe is meaningless because M is tiny (e.g. M=2 for
-    BS=2 decode).
-    """
-    if t is None or t.dim() == 0:
-        return "rows=N/A"
-    M = t.size(0)
-    if M < 2 or M > max_rows:
-        return f"rows=skip(M={M})"
-    if t.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
-        eqs = [bool((t[i] == t[0]).all().item()) for i in range(M)]
-        return "rows=" + "".join("E" if e else "D" for e in eqs)
-    x = t.detach().to(torch.float64)
-    eqs: list[bool] = []
-    diffs: list[float] = []
-    for i in range(M):
-        d = float((x[i] - x[0]).abs().max().item())
-        eqs.append(d == 0.0)
-        diffs.append(d)
-    glyphs = "".join("E" if e else "D" for e in eqs)
-    worst = max(diffs)
-    return f"rows={glyphs} max_row_vs_row0_diff={worst:.6e}"
-
-
-def _marlin_moe_trace(tag: str, **tensors: torch.Tensor | None) -> None:
-    if not _MARLIN_MOE_TRACE:
-        return
-    global _MARLIN_MOE_TRACE_COUNTER
-    _MARLIN_MOE_TRACE_COUNTER += 1
-    parts = [f"[MARLIN-MOE-TRACE #{_MARLIN_MOE_TRACE_COUNTER} {tag}]"]
-    for name, t in tensors.items():
-        parts.append(f"  {name}: {_marlin_moe_fp(t)}")
-        # Extra diagnostic: are the two halves of the row dim equal?
-        # Only meaningful for the BS=2 same-content test but harmless
-        # elsewhere.
-        if t is not None and t.dim() >= 1:
-            parts.append(f"    {_marlin_moe_halves_match(t)}")
-            parts.append(f"    {_marlin_moe_rows_eq(t)}")
-    print("\n".join(parts), file=sys.stderr, flush=True)
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -155,6 +47,29 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+# Marlin thread configs in priority order (from ops.cu large_batch list,
+# which applies when moe_block_size >= 32 → thread_m_blocks > 1).
+# Each entry is (thread_k, thread_n).
+_MARLIN_THREAD_CONFIGS = [(64, 256), (64, 128), (128, 64)]
+
+
+def _select_batch_invariant_thread_config(
+    prob_k: int, prob_n: int
+) -> tuple[int, int]:
+    """Pick the first valid Marlin thread config for the given K and N.
+
+    Under batch invariance we pin the thread config so
+    ``determine_exec_config`` (which is M-dependent) is bypassed.
+    The chosen config must satisfy the kernel's divisibility requirements.
+    """
+    for tk, tn in _MARLIN_THREAD_CONFIGS:
+        if prob_k % tk == 0 and prob_n % tn == 0:
+            return tk, tn
+    raise ValueError(
+        f"No valid Marlin thread config for K={prob_k}, N={prob_n}. "
+        f"Tried: {_MARLIN_THREAD_CONFIGS}"
+    )
 
 
 def _fused_marlin_moe(
@@ -229,14 +144,8 @@ def _fused_marlin_moe(
         # and the M-dependent thread-tile scoring does not change
         # the accumulation order across batch sizes. The bypass is enabled
         # inside ops.cu whenever thread_k != -1 && thread_n != -1.
-        #
-        # Valid configs from THREAD_CONFIGS:
-        #   (128, 128), (64, 256), (64, 128), (128, 64)
-        # Override via env vars for experimentation:
-        bi_thread_k = int(os.environ.get(
-            "VLLM_MARLIN_MOE_BI_THREAD_K", "128"))
-        bi_thread_n = int(os.environ.get(
-            "VLLM_MARLIN_MOE_BI_THREAD_N", "64"))
+        bi_thread_k, bi_thread_n = _select_batch_invariant_thread_config(
+            K, w13_num_shards * N)
         bi_blocks_per_sm = 1
     else:
         bi_thread_k = -1
@@ -429,16 +338,6 @@ def fused_marlin_moe(
     E = w1.size(0)
     topk = topk_ids.size(1)
 
-    if _MARLIN_MOE_TRACE:
-        _marlin_moe_trace(
-            f"fused_marlin_moe ENTRY M={M} K={K} E={E} topk={topk} "
-            f"BI={envs.VLLM_BATCH_INVARIANT}",
-            hidden_states=hidden_states,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            w1_ptr=torch.tensor([w1.data_ptr()], dtype=torch.int64),
-        )
-
     # Check constraints.
     assert w1.size(1) * 16 == K, "Hidden size mismatch w1"
     assert w2.size(2) // (num_bits // 2) == K, "Hidden size mismatch w2"
@@ -474,15 +373,6 @@ def fused_marlin_moe(
         expert_map,
         ignore_invalid_experts=True,
     )
-
-    if _MARLIN_MOE_TRACE:
-        _marlin_moe_trace(
-            f"moe_align_block_size RESULT M={M} "
-            f"block_size_m={block_size_m} global_num_experts={global_num_experts}",
-            sorted_token_ids=sorted_token_ids,
-            expert_ids=expert_ids,
-            num_tokens_post_padded=num_tokens_post_padded,
-        )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
@@ -532,12 +422,6 @@ def fused_marlin_moe(
         # so the real post-reduction tensor is `output`, not `result`.
         result = moe_sum(moe_output, output)
 
-    if _MARLIN_MOE_TRACE:
-        _marlin_moe_trace(
-            f"fused_marlin_moe EXIT M={M} K={K}",
-            moe_output=moe_output,
-            output=output,
-        )
     return result
 
 
