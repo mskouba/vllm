@@ -424,25 +424,25 @@ __global__ void Marlin(
   int part1_mn_iters = 0;
   bool in_part2 = false;
 
-  // we use DP + two-tile SK here
-  // part1: DP
-  // part2: two-tile SK
-  // see https://github.com/vllm-project/vllm/pull/24722 for more details
-  if (global_mn_tiles > gridDim.x) {
+  int iters;
+  if (no_k_split) {
+    // Batch-invariance: force pure data-parallel.  Every tile must be
+    // processed by exactly one block with full K (slice_count=1, no c_tmp
+    // reduction).  No Part2 inflation, iters pinned to k_tiles.
     part2_mn_tiles = global_mn_tiles % gridDim.x;
-    if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
-    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
-  }
-
-  int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
-
-  // Under batch-invariance (no_k_split), force each block to handle all
-  // K-slices for its tile.  This prevents Stream-K from splitting the
-  // K-dimension across blocks, which would route partial sums through the
-  // c_tmp reduction buffer whose slot mapping depends on the total tile
-  // count (and therefore on M), breaking bitwise batch invariance.
-  if (no_k_split && iters < k_tiles) {
+    part1_mn_iters = global_mn_tiles / gridDim.x;
     iters = k_tiles;
+  } else {
+    // we use DP + two-tile SK here
+    // part1: DP
+    // part2: two-tile SK
+    // see https://github.com/vllm-project/vllm/pull/24722 for more details
+    if (global_mn_tiles > gridDim.x) {
+      part2_mn_tiles = global_mn_tiles % gridDim.x;
+      if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
+      part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
+    }
+    iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
   }
 
   if constexpr (!has_act_order && group_blocks != -1) {
