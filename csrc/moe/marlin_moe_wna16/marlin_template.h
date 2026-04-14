@@ -19,6 +19,13 @@
  * Adapted from https://github.com/IST-DASLab/marlin
  */
 
+// >>> DEBUG: unconditionally enable trace for batch-invariance diagnosis <<<
+// Remove this block before shipping.
+#define MARLIN_MOE_TRACE
+#define MARLIN_MOE_TRACE_TARGET_ROW 0
+#define MARLIN_MOE_TRACE_TARGET_COL -1
+// >>> END DEBUG <<<
+
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
