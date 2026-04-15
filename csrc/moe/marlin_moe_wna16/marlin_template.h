@@ -19,12 +19,6 @@
  * Adapted from https://github.com/IST-DASLab/marlin
  */
 
-// >>> DEBUG: uncomment to enable kernel trace <<<
-// #define MARLIN_MOE_TRACE
-// #define MARLIN_MOE_TRACE_TARGET_ROW 0
-// #define MARLIN_MOE_TRACE_TARGET_COL -1
-// >>> END DEBUG <<<
-
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
@@ -315,29 +309,6 @@ __global__ void Marlin(
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   constexpr int moe_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
 
-#ifdef MARLIN_MOE_TRACE
-  // ---- Batch-invariance trace infrastructure ----
-  // Target: first original token (sorted_row / top_k == 0).
-  // We log tile assignments (TILE), per-warp frag_c before reduce (WARP),
-  // fp32 values in write lambda (FP32), and global write coords (GWRITE).
-  // Compile with: -DMARLIN_MOE_TRACE  and optionally
-  //   -DMARLIN_MOE_TRACE_TARGET_ROW=0   (sorted_row to trace, default 0)
-  //   -DMARLIN_MOE_TRACE_TARGET_COL=2860 (bf16 col to trace, -1=all)
-  #ifndef MARLIN_MOE_TRACE_TARGET_ROW
-    #define MARLIN_MOE_TRACE_TARGET_ROW 0
-  #endif
-  #ifndef MARLIN_MOE_TRACE_TARGET_COL
-    #define MARLIN_MOE_TRACE_TARGET_COL -1
-  #endif
-  const int _trace_target_row = MARLIN_MOE_TRACE_TARGET_ROW;
-  const int _trace_target_col = MARLIN_MOE_TRACE_TARGET_COL;
-  // Half-open column window around target (±4 int4 = ±32 bf16 cols)
-  const int _trace_col_lo = _trace_target_col < 0
-      ? 0 : (_trace_target_col / 8 - 4);
-  const int _trace_col_hi = _trace_target_col < 0
-      ? prob_n / 8 : (_trace_target_col / 8 + 5);
-#endif
-
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
   static constexpr auto num_bits =
       vllm::ScalarType::from_id(b_type_id).size_bits();
@@ -599,36 +570,6 @@ __global__ void Marlin(
     }
 
     read_moe_block_data(block_id);
-
-#ifdef MARLIN_MOE_TRACE
-    if (threadIdx.x == 0) {
-      // Check if target token is in this block
-      bool has_target = false;
-      for (int _t = 0; _t < moe_block_size && _t < block_num_valid_tokens; _t++) {
-        if (sh_block_sorted_ids[_t] == _trace_target_row) {
-          has_target = true;
-          break;
-        }
-      }
-      if (has_target) {
-        printf("TILE: blk=%d par=%d expert=%lld slice_col=%d "
-               "valid=%d iters=%d part1left=%d in_part2=%d "
-               "n_tiles=%d parallel=%d global_mn=%d\n",
-               blockIdx.x, (int)par_id, expert_id, slice_col,
-               (int)block_num_valid_tokens, (int)iters, part1_mn_iters,
-               (int)in_part2, n_tiles, parallel,
-               (int)(parallel * n_tiles));
-        // Dump sorted_token_ids for this block
-        printf("TILE_STIDS: blk=%d [", blockIdx.x);
-        for (int _t = 0; _t < moe_block_size && _t < 16; _t++) {
-          printf("%d%s", sh_block_sorted_ids[_t],
-                 _t < 15 ? "," : "");
-        }
-        printf("]\n");
-      }
-    }
-    __syncthreads();
-#endif
   };
 
   // Compute all information about the current slice which is required for
@@ -1964,50 +1905,9 @@ __global__ void Marlin(
               atomicAdd(&C_half2[a], sh_red_half2[a]);
             }
           } else {
-#ifdef MARLIN_MOE_TRACE
-            if (sorted_row == _trace_target_row) {
-              int _col_int4 = (int)(c_gl_wr % c_gl_stride);
-              if (_col_int4 >= _trace_col_lo && _col_int4 < _trace_col_hi) {
-                float _v[8];
-                for (int _x = 0; _x < 4; _x++) {
-                  c_scalar_t* _h = reinterpret_cast<c_scalar_t*>(
-                      &sh_red_half2[_x]);
-                  _v[_x*2]   = Cdtype::num2float(_h[0]);
-                  _v[_x*2+1] = Cdtype::num2float(_h[1]);
-                }
-                printf("GWRITE_MTW: blk=%d tid=%d par=%d scol=%d "
-                       "srow=%lld col_i4=%d bf16col=%d "
-                       "v=[%.8e,%.8e,%.8e,%.8e,%.8e,%.8e,%.8e,%.8e]\n",
-                       blockIdx.x, threadIdx.x, (int)par_id, slice_col,
-                       sorted_row, _col_int4, _col_int4 * 8,
-                       _v[0],_v[1],_v[2],_v[3],_v[4],_v[5],_v[6],_v[7]);
-              }
-            }
-#endif
             C[true_idx] = *reinterpret_cast<int4*>(sh_red_half2);
           }
         } else {
-#ifdef MARLIN_MOE_TRACE
-          if (sorted_row == _trace_target_row) {
-            int _col_int4 = (int)(c_gl_wr % c_gl_stride);
-            if (_col_int4 >= _trace_col_lo && _col_int4 < _trace_col_hi) {
-              // Decode the 8 bf16 values being written (from sh_red)
-              c_scalar_t* _vals = reinterpret_cast<c_scalar_t*>(
-                  &sh_red[c_sh_rd]);
-              float _v[8];
-              for (int _x = 0; _x < 8; _x++)
-                _v[_x] = Cdtype::num2float(_vals[_x]);
-              int _bf16_col = _col_int4 * 8;
-              printf("GWRITE: blk=%d tid=%d par=%d scol=%d "
-                     "srow=%lld row=%d col_i4=%d bf16col=%d "
-                     "v=[%.8e,%.8e,%.8e,%.8e,%.8e,%.8e,%.8e,%.8e]\n",
-                     blockIdx.x, threadIdx.x, (int)par_id, slice_col,
-                     sorted_row, row, _col_int4, _bf16_col,
-                     _v[0], _v[1], _v[2], _v[3],
-                     _v[4], _v[5], _v[6], _v[7]);
-            }
-          }
-#endif
           C[true_idx] = sh_red[c_sh_rd];
         }
         c_gl_wr += c_gl_wr_delta;
@@ -2180,138 +2080,7 @@ __global__ void Marlin(
         }
       }
 
-#ifdef MARLIN_MOE_TRACE
-      // ---- WARP trace: dump per-warp frag_c for target token ----
-      // Check if target row is in this block (block position 0 means
-      // sorted_token_ids[0] == target).
-      {
-        bool _has_target = false;
-        int _target_block_row = -1;
-        for (int _t = 0; _t < moe_block_size && _t < block_num_valid_tokens;
-             _t++) {
-          if (sh_block_sorted_ids[_t] == _trace_target_row) {
-            _has_target = true;
-            _target_block_row = _t;
-            break;
-          }
-        }
-        if (_has_target) {
-          int _warp = threadIdx.x / 32;
-          int _lane = threadIdx.x % 32;
-          // m_block containing the target row
-          int _target_mblock = _target_block_row / 16;
-          int _target_mrow = _target_block_row % 16;
-          // In MMA m16n8k16 output, lane mapping:
-          //   row = lane/4 (0..7) or lane/4+8 (8..15)
-          //   c[0,1] → rows 0..7,  c[2,3] → rows 8..15
-          // Check if this lane holds data for _target_mrow
-          int _lane_row_lo = _lane / 4;       // rows 0..7
-          int _lane_row_hi = _lane_row_lo + 8; // rows 8..15
-          bool _holds_lo = (_lane_row_lo == _target_mrow);
-          bool _holds_hi = (_lane_row_hi == _target_mrow);
-          if (_holds_lo || _holds_hi) {
-            // Print this warp's partial frag_c for the target row.
-            // j=0..3 covers 4 sub-column groups, each 16 cols wide.
-            // frag_c[_target_mblock][j][0] uses c[0,1] (lo) or c[2,3] (hi)
-            // frag_c[_target_mblock][j][1] uses the other half.
-            int _i = _target_mblock;
-            for (int _j = 0; _j < (is_a_8bit ? 2 : 4); _j++) {
-              // Global N column: slice_col * thread_n_blocks*16 + _j*16
-              //   + (_lane%4)*2 for c[0/2], +1 for c[1/3]
-              //   + 8 for frag_c[..][1] half
-              int _base_col = slice_col * thread_n_blocks * 16 + _j * 16
-                              + (_lane % 4) * 2;
-              if (_holds_lo) {
-                printf("WARP: blk=%d warp=%d lane=%d par=%d scol=%d "
-                       "mblk=%d j=%d half=0 "
-                       "col=%d fc=[%.8e,%.8e,%.8e,%.8e]\n",
-                       blockIdx.x, _warp, _lane, (int)par_id, slice_col,
-                       _i, _j, _base_col,
-                       frag_c[_i][_j][0][0], frag_c[_i][_j][0][1],
-                       frag_c[_i][_j][0][2], frag_c[_i][_j][0][3]);
-                printf("WARP: blk=%d warp=%d lane=%d par=%d scol=%d "
-                       "mblk=%d j=%d half=1 "
-                       "col=%d fc=[%.8e,%.8e,%.8e,%.8e]\n",
-                       blockIdx.x, _warp, _lane, (int)par_id, slice_col,
-                       _i, _j, _base_col + 8,
-                       frag_c[_i][_j][1][0], frag_c[_i][_j][1][1],
-                       frag_c[_i][_j][1][2], frag_c[_i][_j][1][3]);
-              }
-              if (_holds_hi) {
-                printf("WARP: blk=%d warp=%d lane=%d par=%d scol=%d "
-                       "mblk=%d j=%d half=0 "
-                       "col=%d fc_hi=[%.8e,%.8e]\n",
-                       blockIdx.x, _warp, _lane, (int)par_id, slice_col,
-                       _i, _j, _base_col,
-                       frag_c[_i][_j][0][2], frag_c[_i][_j][0][3]);
-                printf("WARP: blk=%d warp=%d lane=%d par=%d scol=%d "
-                       "mblk=%d j=%d half=1 "
-                       "col=%d fc_hi=[%.8e,%.8e]\n",
-                       blockIdx.x, _warp, _lane, (int)par_id, slice_col,
-                       _i, _j, _base_col + 8,
-                       frag_c[_i][_j][1][2], frag_c[_i][_j][1][3]);
-              }
-            }
-          }
-        }
-      }
-      __syncthreads();
-#endif
-
       thread_block_reduce();
-
-#ifdef MARLIN_MOE_TRACE
-      // ---- REDUCED trace: warp 0's frag_c after reduce ----
-      {
-        bool _has_target = false;
-        int _target_block_row = -1;
-        for (int _t = 0; _t < moe_block_size && _t < block_num_valid_tokens;
-             _t++) {
-          if (sh_block_sorted_ids[_t] == _trace_target_row) {
-            _has_target = true;
-            _target_block_row = _t;
-            break;
-          }
-        }
-        if (_has_target && threadIdx.x / 32 == 0) {
-          int _lane = threadIdx.x % 32;
-          int _target_mblock = _target_block_row / 16;
-          int _target_mrow = _target_block_row % 16;
-          int _lane_row_lo = _lane / 4;
-          bool _holds_lo = (_lane_row_lo == _target_mrow);
-          bool _holds_hi = (_lane_row_lo + 8 == _target_mrow);
-          if (_holds_lo || _holds_hi) {
-            int _i = _target_mblock;
-            for (int _j = 0; _j < (is_a_8bit ? 2 : 4); _j++) {
-              int _base_col = slice_col * thread_n_blocks * 16 + _j * 16
-                              + (_lane % 4) * 2;
-              if (_holds_lo) {
-                printf("REDUCED: blk=%d lane=%d par=%d scol=%d "
-                       "mblk=%d j=%d "
-                       "col=%d fc0=[%.8e,%.8e,%.8e,%.8e] "
-                       "fc1=[%.8e,%.8e,%.8e,%.8e]\n",
-                       blockIdx.x, _lane, (int)par_id, slice_col,
-                       _i, _j, _base_col,
-                       frag_c[_i][_j][0][0], frag_c[_i][_j][0][1],
-                       frag_c[_i][_j][0][2], frag_c[_i][_j][0][3],
-                       frag_c[_i][_j][1][0], frag_c[_i][_j][1][1],
-                       frag_c[_i][_j][1][2], frag_c[_i][_j][1][3]);
-              }
-              if (_holds_hi) {
-                printf("REDUCED: blk=%d lane=%d par=%d scol=%d "
-                       "mblk=%d j=%d "
-                       "col=%d fc0_hi=[%.8e,%.8e] "
-                       "fc1_hi=[%.8e,%.8e]\n",
-                       blockIdx.x, _lane, (int)par_id, slice_col,
-                       _i, _j, _base_col,
-                       frag_c[_i][_j][0][2], frag_c[_i][_j][0][3],
-                       frag_c[_i][_j][1][2], frag_c[_i][_j][1][3]);
-              }
-            }
-          }
-        }
-      }
-#endif
 
       if (has_bias && last) {
         __syncthreads();
