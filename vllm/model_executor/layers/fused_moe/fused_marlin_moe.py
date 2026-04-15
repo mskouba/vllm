@@ -416,13 +416,9 @@ def fused_marlin_moe(
         output = hidden_states if inplace else torch.empty_like(hidden_states)
 
     if moe_sum is None:
-        result = torch.sum(moe_output.view(-1, topk, K), dim=1, out=output)
+        return torch.sum(moe_output.view(-1, topk, K), dim=1, out=output)
     else:
-        # NOTE: `moe_sum` writes into `output` in-place and returns None,
-        # so the real post-reduction tensor is `output`, not `result`.
-        result = moe_sum(moe_output, output)
-
-    return result
+        return moe_sum(moe_output, output)
 
 
 def batched_fused_marlin_moe(

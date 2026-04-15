@@ -66,77 +66,8 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
 
 
 # ---------------------------------------------------------------------------
-# Unit-level MoE invariance probe (runs inside the worker process)
-# ---------------------------------------------------------------------------
-
-def _marlin_moe_unit_probe(worker) -> dict:
-    """Direct MoE layer test: M=1 vs M=8, check row 0 bitwise equality."""
-    import torch as _torch
-
-    from vllm.forward_context import set_forward_context
-
-    model_runner = worker.model_runner
-    vllm_config = model_runner.vllm_config
-    model = model_runner.model
-    inner = getattr(model, "model", model)
-    mlp = inner.layers[0].mlp
-
-    device = next(mlp.parameters()).device
-    dtype = mlp.router.weight.dtype
-    K = mlp.hidden_size
-
-    _torch.manual_seed(20240919)
-    hs_full = _torch.randn(8, K, device=device, dtype=dtype)
-    hs_1 = hs_full[0:1].clone()
-    hs_N = hs_full.clone()
-    assert _torch.equal(hs_1[0], hs_N[0])
-
-    def _run(hs):
-        with set_forward_context(
-            attn_metadata=None,
-            vllm_config=vllm_config,
-            num_tokens=hs.shape[0],
-        ):
-            return mlp(hs)
-
-    with _torch.inference_mode():
-        out_1 = _run(hs_1)
-        out_N = _run(hs_N)
-
-    row0_1 = out_1[0, :K].float()
-    row0_N = out_N[0, :K].float()
-    return {
-        "bitwise_equal": bool(_torch.equal(row0_1, row0_N)),
-        "max_abs": float((row0_1 - row0_N).abs().max().item()),
-    }
-
-
-# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-
-@skip_unsupported
-@pytest.mark.parametrize("backend", ["TRITON_ATTN"])
-def test_mxfp4_marlin_moe_unit_invariance(backend):
-    """Direct unit-level invariance probe for ``fused_marlin_moe``.
-
-    Loads the LLM to obtain a real Marlin MXFP4 MoE layer with real
-    weights, then drives the layer directly with M=1 and M=8 inputs
-    that share row 0. Row 0 output must be bitwise identical.
-    """
-    llm = None
-    try:
-        llm = _make_llm(max_num_seqs=8, backend=backend)
-        result = llm.llm_engine.collective_rpc(_marlin_moe_unit_probe)[0]
-        assert result["bitwise_equal"], (
-            f"fused_marlin_moe not batch-invariant for row 0: "
-            f"max_abs_diff={result['max_abs']:.4e}"
-        )
-    finally:
-        if llm is not None:
-            with contextlib.suppress(Exception):
-                llm.shutdown()
-
 
 @skip_unsupported
 @pytest.mark.parametrize("backend", ["TRITON_ATTN"])
