@@ -142,15 +142,16 @@ def _fused_marlin_moe(
     if envs.VLLM_BATCH_INVARIANT:
         # Pin thread config so determine_exec_config is bypassed
         # and the M-dependent thread-tile scoring does not change
-        # the accumulation order across batch sizes. The bypass is enabled
-        # inside ops.cu whenever thread_k != -1 && thread_n != -1.
-        bi_thread_k, bi_thread_n = _select_batch_invariant_thread_config(
+        # the accumulation order across batch sizes.
+        thread_k, thread_n = _select_batch_invariant_thread_config(
             K, w13_num_shards * N)
-        bi_blocks_per_sm = 1
+        blocks_per_sm = 1
+        use_full_k = True
     else:
-        bi_thread_k = -1
-        bi_thread_n = -1
-        bi_blocks_per_sm = -1
+        thread_k = -1
+        thread_n = -1
+        blocks_per_sm = -1
+        use_full_k = False
 
     a_scales1 = None
     gate_up_input = hidden_states
@@ -188,9 +189,10 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
-        thread_k=bi_thread_k,
-        thread_n=bi_thread_n,
-        blocks_per_sm=bi_blocks_per_sm,
+        thread_k=thread_k,
+        thread_n=thread_n,
+        blocks_per_sm=blocks_per_sm,
+        use_full_k=use_full_k,
     )
     activation_func(
         activation,
@@ -243,9 +245,10 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
-        thread_k=bi_thread_k,
-        thread_n=bi_thread_n,
-        blocks_per_sm=bi_blocks_per_sm,
+        thread_k=thread_k,
+        thread_n=thread_n,
+        blocks_per_sm=blocks_per_sm,
+        use_full_k=use_full_k,
     )
 
     return output

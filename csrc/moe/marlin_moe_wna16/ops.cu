@@ -346,7 +346,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
                bool use_fp32_reduce, bool is_zp_float,
-               bool no_k_split = false) {
+               bool use_full_k) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -528,7 +528,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
       prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce,
-      no_k_split);
+      use_full_k);
   // clang-format on
 }
 
@@ -549,7 +549,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float, int64_t thread_k, int64_t thread_n,
-    int64_t blocks_per_sm) {
+    int64_t blocks_per_sm, bool use_full_k) {
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_dtype = a.dtype();
@@ -855,14 +855,6 @@ torch::Tensor moe_wna16_marlin_gemm(
         "scalar type of a must be the same with c for 16 bit activation");
   }
 
-  // Under batch-invariance (indicated by an explicit thread config via
-  // thread_k/thread_n), disable Stream-K work partitioning so each output
-  // tile is processed entirely by one threadblock (pure DP).  This avoids
-  // K-splitting across blocks, which would route partial sums through the
-  // c_tmp reduction buffer whose slot assignment depends on the total tile
-  // count (and therefore on M), breaking bitwise batch invariance.
-  bool no_k_split = (thread_k > 0 && thread_n > 0);
-
   MARLIN_NAMESPACE_NAME::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),
       b_bias.data_ptr(), a_scales.data_ptr(), b_scales.data_ptr(),
@@ -874,7 +866,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
-      is_zp_float, no_k_split);
+      is_zp_float, use_full_k);
 
   return c;
 }

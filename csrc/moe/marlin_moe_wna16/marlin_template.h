@@ -78,7 +78,7 @@ __global__ void Marlin(
     int* locks,             // extra global storage for barrier synchronization
     bool use_atomic_add,    // whether to use atomic add to reduce
     bool use_fp32_reduce,   // whether to use fp32 global reduce
-    bool no_k_split         // disable K-splitting for batch invariance
+    bool use_full_k         // whether to use full-K reduction per block (pure DP)
 ) {}
 
 }  // namespace MARLIN_NAMESPACE_NAME
@@ -281,7 +281,7 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,  // whether to use atomic add to reduce
     bool use_fp32_reduce, // whether to use fp32 global reduce
-    bool no_k_split       // disable K-splitting for batch invariance
+    bool use_full_k       // whether to use full-K reduction per block (pure DP)
 ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
@@ -395,26 +395,18 @@ __global__ void Marlin(
   int part1_mn_iters = 0;
   bool in_part2 = false;
 
-  int iters;
-  if (no_k_split) {
-    // Batch-invariance: force pure data-parallel.  Every tile must be
-    // processed by exactly one block with full K (slice_count=1, no c_tmp
-    // reduction).  No Part2 inflation, iters pinned to k_tiles.
+  // we use DP + two-tile SK here
+  // part1: DP
+  // part2: two-tile SK
+  // see https://github.com/vllm-project/vllm/pull/24722 for more details
+  if (global_mn_tiles > gridDim.x) {
     part2_mn_tiles = global_mn_tiles % gridDim.x;
-    part1_mn_iters = global_mn_tiles / gridDim.x;
-    iters = k_tiles;
-  } else {
-    // we use DP + two-tile SK here
-    // part1: DP
-    // part2: two-tile SK
-    // see https://github.com/vllm-project/vllm/pull/24722 for more details
-    if (global_mn_tiles > gridDim.x) {
-      part2_mn_tiles = global_mn_tiles % gridDim.x;
-      if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
-      part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
-    }
-    iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
+    if (!use_full_k && part2_mn_tiles * 3 <= gridDim.x)
+      part2_mn_tiles += gridDim.x;
+    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
   }
+  int iters = use_full_k ? k_tiles
+                         : div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
 
   if constexpr (!has_act_order && group_blocks != -1) {
     if (group_blocks >= thread_k_blocks) {
