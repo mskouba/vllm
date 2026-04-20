@@ -4,6 +4,7 @@
 
 #include "scaled_mm_c2x.cuh"
 #include "cutlass/float8.h"
+#include "core/batch_invariant.hpp"
 
 /**
  * This file defines Gemm kernel configurations for SM89 (FP8) based on the Gemm
@@ -349,6 +350,13 @@ inline void cutlass_gemm_sm89_fp8_dispatch(torch::stable::Tensor& out,
                   torch::headeronly::ScalarType::Float8_e4m3fn);
   STD_TORCH_CHECK(b.scalar_type() ==
                   torch::headeronly::ScalarType::Float8_e4m3fn);
+
+  // When batch invariant, pin to default config for all M values to ensure
+  // identical accumulation order regardless of batch size.
+  if (vllm_is_batch_invariant()) {
+    return sm89_fp8_config_default::dispatch<InType, OutType, Epilogue>(
+        out, a, b, std::forward<EpilogueArgs>(args)...);
+  }
 
   uint32_t const m = a.size(0);
   uint32_t const mp2 =

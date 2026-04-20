@@ -5,6 +5,7 @@
 #include "scaled_mm.cuh"
 #include "cutlass_gemm_caller.cuh"
 #include "cutlass_extensions/epilogue/scaled_mm_epilogues_c3x.hpp"
+#include "core/batch_invariant.hpp"
 
 /**
  * This file defines Gemm kernel configurations for SM90 (fp8) based on the Gemm
@@ -314,6 +315,13 @@ inline void cutlass_gemm_sm90_fp8_dispatch(
   using Cutlass3xGemmM16_N8192 =
       typename sm90_fp8_config_M16_N8192<InType, OutType,
                                          EnableBias>::Cutlass3xGemm;
+
+  // When batch invariant, pin to default config for all M values to ensure
+  // identical accumulation order regardless of batch size.
+  if (vllm_is_batch_invariant()) {
+    return cutlass_gemm_caller_sm90_fp8<Cutlass3xGemmDefault>(
+        out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(args)...);
+  }
 
   uint32_t const m = a.size(0);
   uint32_t const n = b.size(1);
