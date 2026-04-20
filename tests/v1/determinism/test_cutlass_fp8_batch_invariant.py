@@ -46,7 +46,7 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
 
 
 @skip_unsupported
-@pytest.mark.parametrize("backend", ["FLASH_ATTN"])
+@pytest.mark.parametrize("backend", ["FLASH_ATTN", "TRITON_ATTN"])
 def test_cutlass_fp8_logprobs_bitwise_batch_invariance(backend):
     """
     Verifies that the same needle prompt produces bitwise-identical logprobs
