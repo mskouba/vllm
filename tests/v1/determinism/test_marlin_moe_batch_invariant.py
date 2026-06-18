@@ -173,9 +173,9 @@ def test_forced_mxfp4_marlin_is_accepted_under_batch_invariance(
         select_mxfp4_moe_backend,
     )
 
-    monkeypatch.setattr(envs, "VLLM_MXFP4_USE_MARLIN", True)
     monkeypatch.setenv("VLLM_MXFP4_USE_MARLIN", "1")
     assert envs.VLLM_BATCH_INVARIANT
+    assert envs.VLLM_MXFP4_USE_MARLIN
 
     with set_current_vllm_config(VllmConfig()):
         moe_config = FusedMoEConfig(
