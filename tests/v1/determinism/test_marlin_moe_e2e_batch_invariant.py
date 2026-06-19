@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """End-to-end batch invariance test for the WNA16 Marlin MoE path.
 
-The default model is a small compressed-tensors W4A16 MoE checkpoint whose
-experts route through ``MarlinExperts`` (``fused_marlin_moe`` ->
-``moe_wna16_marlin_gemm``), validating the full load/select/kernel stack under
-``VLLM_BATCH_INVARIANT``.
+The default model is a compressed-tensors W4A16 MoE checkpoint with *all*
+expert weights quantized, so every MoE layer routes through ``MarlinExperts``
+(``fused_marlin_moe`` -> ``moe_wna16_marlin_gemm``). A model that quantizes
+only some layers would leave the remaining experts on a different kernel, so
+the result would not isolate the Marlin path. This validates the full
+load/select/kernel stack under ``VLLM_BATCH_INVARIANT``.
 """
 
 import contextlib
@@ -24,7 +26,7 @@ from vllm import LLM, SamplingParams
 
 MARLIN_MOE_MODEL = os.getenv(
     "VLLM_TEST_MARLIN_MOE_MODEL",
-    "nm-testing/tinysmokeqwen3moe-W4A16-first-only-CTstable",
+    "nm-testing/Qwen1.5-MoE-A2.7B-Chat-quantized.w4a16",
 )
 
 
@@ -33,7 +35,7 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
         model=MARLIN_MOE_MODEL,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=float(
-            os.getenv("VLLM_MARLIN_MOE_TEST_GPU_MEMORY_UTILIZATION", "0.3")
+            os.getenv("VLLM_MARLIN_MOE_TEST_GPU_MEMORY_UTILIZATION", "0.6")
         ),
         max_model_len=int(os.getenv("VLLM_MARLIN_MOE_TEST_MAX_MODEL_LEN", "2048")),
         dtype="auto",
