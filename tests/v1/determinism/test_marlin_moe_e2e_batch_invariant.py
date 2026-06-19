@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end batch invariance test for the GPTQ-Marlin MoE path."""
+"""End-to-end batch invariance test for the WNA16 Marlin MoE path.
+
+The default model is a small compressed-tensors W4A16 MoE checkpoint whose
+experts route through ``MarlinExperts`` (``fused_marlin_moe`` ->
+``moe_wna16_marlin_gemm``), validating the full load/select/kernel stack under
+``VLLM_BATCH_INVARIANT``.
+"""
 
 import contextlib
 import os
@@ -16,21 +22,22 @@ from utils import (
 
 from vllm import LLM, SamplingParams
 
-GPTQ_MOE_MODEL = os.getenv(
-    "VLLM_TEST_GPTQ_MOE_MODEL", "Qwen/Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4"
+MARLIN_MOE_MODEL = os.getenv(
+    "VLLM_TEST_MARLIN_MOE_MODEL",
+    "nm-testing/tinysmokeqwen3moe-W4A16-first-only-CTstable",
 )
 
 
 def _make_llm(max_num_seqs: int, backend: str) -> LLM:
     return LLM(
-        model=GPTQ_MOE_MODEL,
+        model=MARLIN_MOE_MODEL,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=float(
-            os.getenv("VLLM_GPTQ_MOE_TEST_GPU_MEMORY_UTILIZATION", "0.9")
+            os.getenv("VLLM_MARLIN_MOE_TEST_GPU_MEMORY_UTILIZATION", "0.3")
         ),
-        max_model_len=int(os.getenv("VLLM_GPTQ_MOE_TEST_MAX_MODEL_LEN", "2048")),
+        max_model_len=int(os.getenv("VLLM_MARLIN_MOE_TEST_MAX_MODEL_LEN", "2048")),
         dtype="auto",
-        tensor_parallel_size=int(os.getenv("VLLM_GPTQ_MOE_TEST_TP_SIZE", "1")),
+        tensor_parallel_size=int(os.getenv("VLLM_MARLIN_MOE_TEST_TP_SIZE", "1")),
         enable_prefix_caching=False,
         enforce_eager=True,
         attention_config={"backend": backend},
@@ -39,21 +46,21 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
 
 @skip_unsupported
 @pytest.mark.parametrize("backend", ["FLASH_ATTN"])
-def test_gptq_marlin_moe_bs1_vs_bsN_is_bitwise_invariant(backend):
-    """BS=1 vs BS=N bitwise equality on the GPTQ-Marlin MoE path."""
+def test_marlin_moe_bs1_vs_bsN_is_bitwise_invariant(backend):
+    """BS=1 vs BS=N bitwise equality on the Marlin MoE path."""
     seed = int(os.getenv("VLLM_TEST_SEED", "12345"))
     random.seed(seed)
 
-    num_trials = int(os.getenv("VLLM_GPTQ_MOE_NEEDLE_TRIALS", "2"))
-    max_batch_size = int(os.getenv("VLLM_GPTQ_MOE_NEEDLE_BATCH_SIZE", "8"))
-    min_random_prompt = int(os.getenv("VLLM_GPTQ_MOE_MIN_PROMPT", "32"))
-    max_random_prompt = int(os.getenv("VLLM_GPTQ_MOE_MAX_PROMPT", "96"))
+    num_trials = int(os.getenv("VLLM_MARLIN_MOE_NEEDLE_TRIALS", "2"))
+    max_batch_size = int(os.getenv("VLLM_MARLIN_MOE_NEEDLE_BATCH_SIZE", "8"))
+    min_random_prompt = int(os.getenv("VLLM_MARLIN_MOE_MIN_PROMPT", "32"))
+    max_random_prompt = int(os.getenv("VLLM_MARLIN_MOE_MAX_PROMPT", "96"))
     assert max_batch_size >= 2, "Batch size should be >= 2 to test invariance."
 
     sampling = SamplingParams(
-        temperature=float(os.getenv("VLLM_GPTQ_MOE_NEEDLE_TEMPERATURE", "0.6")),
-        top_p=float(os.getenv("VLLM_GPTQ_MOE_NEEDLE_TOP_P", "0.95")),
-        max_tokens=int(os.getenv("VLLM_GPTQ_MOE_NEEDLE_MAX_TOKENS", "32")),
+        temperature=float(os.getenv("VLLM_MARLIN_MOE_NEEDLE_TEMPERATURE", "0.6")),
+        top_p=float(os.getenv("VLLM_MARLIN_MOE_NEEDLE_TOP_P", "0.95")),
+        max_tokens=int(os.getenv("VLLM_MARLIN_MOE_NEEDLE_MAX_TOKENS", "32")),
         seed=20240919,
         logprobs=5,
     )
