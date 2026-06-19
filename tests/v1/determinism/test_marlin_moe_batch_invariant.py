@@ -157,9 +157,7 @@ def test_marlin_moe_kernel_is_batch_invariant(scheme: Scheme, batch_size: int):
 
 
 @skip_unsupported
-def test_forced_mxfp4_marlin_is_accepted_under_batch_invariance(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_forced_mxfp4_marlin_is_accepted_under_batch_invariance():
     """Forcing MXFP4 Marlin selects it (rather than rejecting it as
     non-batch-invariant) when batch invariance is enabled."""
     from vllm.model_executor.layers.fused_moe import FusedMoEConfig
@@ -173,9 +171,7 @@ def test_forced_mxfp4_marlin_is_accepted_under_batch_invariance(
         select_mxfp4_moe_backend,
     )
 
-    monkeypatch.setenv("VLLM_MXFP4_USE_MARLIN", "1")
     assert envs.VLLM_BATCH_INVARIANT
-    assert envs.VLLM_MXFP4_USE_MARLIN
 
     with set_current_vllm_config(VllmConfig()):
         moe_config = FusedMoEConfig(
@@ -190,6 +186,7 @@ def test_forced_mxfp4_marlin_is_accepted_under_batch_invariance(
             in_dtype=torch.bfloat16,
             device="cuda",
             routing_method=RoutingMethodType.Renormalize,
+            moe_backend="marlin",
         )
         backend, experts_cls = select_mxfp4_moe_backend(moe_config)
 
