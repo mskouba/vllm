@@ -45,6 +45,7 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
 
 
 @skip_unsupported
+@pytest.mark.timeout(1000)
 @pytest.mark.parametrize("backend", ["FLASH_ATTN"])
 def test_marlin_moe_bs1_vs_bsN_is_bitwise_invariant(backend):
     """BS=1 vs BS=N bitwise equality on the Marlin MoE path."""
