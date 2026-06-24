@@ -14,6 +14,7 @@ import torch
 from utils import skip_unsupported
 
 import vllm.envs as envs
+from tests.kernels.utils import torch_experts
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
@@ -33,13 +34,14 @@ class Scheme:
     b_type: ScalarType
     group_size: int
     dtype: torch.dtype
+    ref_atol: float
 
 
 SCHEMES: list[Scheme] = [
-    Scheme("awq_int4", scalar_types.uint4, 128, torch.float16),
-    Scheme("gptq_int4", scalar_types.uint4b8, 128, torch.float16),
-    Scheme("gptq_int8", scalar_types.uint8b128, 128, torch.float16),
-    Scheme("mxfp4", scalar_types.float4_e2m1f, 32, torch.bfloat16),
+    Scheme("awq_int4", scalar_types.uint4, 128, torch.float16, 4e-2),
+    Scheme("gptq_int4", scalar_types.uint4b8, 128, torch.float16, 4e-2),
+    Scheme("gptq_int8", scalar_types.uint8b128, 128, torch.float16, 4e-2),
+    Scheme("mxfp4", scalar_types.float4_e2m1f, 32, torch.bfloat16, 1e-1),
 ]
 
 
@@ -55,6 +57,7 @@ def _quantize_experts(
     has_zp = quant_type in (scalar_types.uint4, scalar_types.uint8)
     k = w.shape[-1]
 
+    w_ref_l: list[torch.Tensor] = []
     qweight_l: list[torch.Tensor] = []
     scales_l: list[torch.Tensor] = []
     zeros_l: list[torch.Tensor] = []
@@ -63,11 +66,11 @@ def _quantize_experts(
 
     for i in range(w.shape[0]):
         if quant_type == scalar_types.float4_e2m1f:
-            _, qweight, scales = rand_marlin_weight_mxfp4_like(w[i], group_size)
+            w_ref, qweight, scales = rand_marlin_weight_mxfp4_like(w[i], group_size)
             qweight_l.append(qweight)
             scales_l.append(scales)
         elif has_zp:
-            _, qweight, scales, zeros = awq_marlin_quantize(
+            w_ref, qweight, scales, zeros = awq_marlin_quantize(
                 w[i].transpose(1, 0), quant_type, group_size
             )
             qweight_l.append(qweight)
@@ -75,15 +78,17 @@ def _quantize_experts(
             zeros_l.append(zeros)
         else:
             test_perm = torch.randperm(k)
-            _, qweight, scales, g_idx, sort_indices, _ = marlin_quantize(
+            w_ref, qweight, scales, g_idx, sort_indices, _ = marlin_quantize(
                 w[i].transpose(1, 0), quant_type, group_size, False, test_perm
             )
             qweight_l.append(qweight)
             scales_l.append(scales)
             g_idx_l.append(g_idx)
             sort_l.append(sort_indices)
+        w_ref_l.append(w_ref.T)
 
     return {
+        "w_ref": _stack(w_ref_l),
         "qweight": _stack(qweight_l).contiguous(),
         "scales": _stack(scales_l),
         "zeros": _stack(zeros_l) if zeros_l else None,
@@ -101,12 +106,12 @@ SHAPES: list[tuple[int, int]] = [(512, 512), (1024, 2048)]
 @skip_unsupported
 @pytest.mark.parametrize("scheme", SCHEMES, ids=[s.name for s in SCHEMES])
 @pytest.mark.parametrize("n,k", SHAPES, ids=["small", "large"])
-@pytest.mark.parametrize("batch_size", [4, 16, 64])
+@pytest.mark.parametrize("batch_size", [4, 16, 64, 257])
 def test_marlin_moe_kernel_is_batch_invariant(
     scheme: Scheme, n: int, k: int, batch_size: int
 ):
     """A token's Marlin MoE output is bitwise identical regardless of batch
-    size or its position in the batch."""
+    size or its position in the batch, and matches a dequantized reference."""
     assert envs.VLLM_BATCH_INVARIANT
 
     torch.manual_seed(0)
@@ -147,6 +152,16 @@ def test_marlin_moe_kernel_is_batch_invariant(
 
     with set_current_vllm_config(VllmConfig()):
         baseline = run(token, token_score)[0]
+        ref_weights, ref_ids, _ = fused_topk(token, token_score, topk, False)
+        ref = torch_experts(
+            token,
+            w1q["w_ref"],
+            w2q["w_ref"],
+            topk_weight=ref_weights,
+            topk_ids=ref_ids,
+            global_num_experts=e,
+        )
+        torch.testing.assert_close(baseline, ref[0], rtol=0.0, atol=scheme.ref_atol)
 
         filler_a = torch.randn((batch_size - 1, k), device="cuda", dtype=dtype) / 10
         filler_score = torch.randn((batch_size - 1, e), device="cuda", dtype=dtype)
