@@ -10,6 +10,7 @@ Environment variables:
 
 """
 
+import concurrent.futures as cf
 import os
 import random
 import sys
@@ -17,7 +18,13 @@ from typing import Any
 
 import openai
 import pytest
-from utils import BACKENDS, TEST_MODEL, _random_prompt, skip_if_not_cuda
+from utils import (
+    BACKENDS,
+    TEST_MODEL,
+    _random_prompt,
+    long_probe_prompt,
+    skip_if_not_cuda,
+)
 
 from tests.utils import RemoteOpenAIServer
 
@@ -166,3 +173,113 @@ def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
             client=client,
             model_name=TEST_MODEL,
         )
+
+
+def _filler_prompt(idx: int, num_words: int = 2000) -> str:
+    words = (
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu "
+        "nu xi omicron pi rho sigma tau upsilon phi chi psi omega"
+    ).split()
+    body = " ".join(words[(i + idx) % len(words)] for i in range(num_words))
+    return f"Request {idx}. Continue this list of terms:\n\n" + body
+
+
+@skip_if_not_cuda
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_probe_invariance_under_async_scheduling_churn(backend: str) -> None:
+    """Probe stays bitwise-identical while batch composition churns mid-decode.
+
+    Unlike the bs1-vs-bsN test above, this keeps async scheduling ON (the
+    default) and fires concurrent fillers with *staggered* ``max_tokens`` so
+    fillers retire at different decode steps. Batch composition therefore keeps
+    changing while the long probe is still generating.
+
+    A complete batch-invariant configuration is expected to return the exact
+    same probe tokens and logprobs every round despite that churn. A single
+    residual composition-dependent reduction (an incompletely invariant kernel)
+    shows up here as a probe flip across rounds, even though the static
+    bs1-vs-bsN test above passes. See the discussion on PR #51287.
+    """
+    num_rounds = int(os.getenv("VLLM_PROBE_ROUNDS", "3"))
+    num_fillers = int(os.getenv("VLLM_PROBE_FILLERS", "24"))
+    probe_max_tokens = int(os.getenv("VLLM_PROBE_MAX_TOKENS", "256"))
+
+    probe = long_probe_prompt()
+    probe_sp: dict[str, Any] = {
+        "temperature": 0.0,
+        "max_tokens": probe_max_tokens,
+        "seed": 20240919,
+        "logprobs": 1,
+    }
+
+    server_args: list[str] = [
+        "--max-model-len=16384",
+        f"--max-num-seqs={num_fillers + 1}",
+        f"--attention-backend={backend}",
+        # The path under test. Async scheduling is on by default; pass it
+        # explicitly so this test still churns composition if the default flips.
+        "--async-scheduling",
+        # Isolate kernel numerics from cache-reuse effects.
+        "--no-enable-prefix-caching",
+    ]
+
+    baseline_tokens: list[Any] | None = None
+    baseline_logprobs: list[float] | None = None
+
+    with RemoteOpenAIServer(TEST_MODEL, server_args) as server:
+        client = server.get_client()
+
+        for rnd in range(num_rounds):
+            jobs: list[tuple[str, dict[str, Any]]] = [(probe, probe_sp)]
+            for i in range(num_fillers):
+                jobs.append(
+                    (
+                        _filler_prompt(i),
+                        {
+                            "temperature": 0.0,
+                            # Staggered retirement: fillers stop at different
+                            # decode steps, so composition churns under the probe.
+                            "max_tokens": 64 + (i % 8) * 24,
+                            "seed": 1234 + i,
+                        },
+                    )
+                )
+
+            with cf.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+                results = list(
+                    pool.map(
+                        lambda j: _request_completion(
+                            client, TEST_MODEL, j[0], j[1]
+                        ),
+                        jobs,
+                    )
+                )
+
+            probe_resp = results[0]
+            if probe_resp is None or not probe_resp.get("choices"):
+                raise AssertionError(f"Round {rnd}: probe request failed")
+            tokens, logprobs = _extract_tokens_and_logprobs(probe_resp["choices"][0])
+            if logprobs is None:
+                raise AssertionError(
+                    "logprobs not returned; ensure server supports 'logprobs'"
+                )
+
+            if baseline_tokens is None:
+                baseline_tokens = tokens
+                baseline_logprobs = logprobs
+                continue
+
+            if tokens != baseline_tokens:
+                raise AssertionError(
+                    f"Round {rnd}: probe token divergence under async-scheduling "
+                    f"composition churn.\n"
+                    f"baseline={baseline_tokens}\n"
+                    f"got     ={tokens}"
+                )
+            assert baseline_logprobs is not None
+            for t, (a, b) in enumerate(zip(baseline_logprobs, logprobs)):
+                if a != b:
+                    raise AssertionError(
+                        f"Round {rnd} step {t}: probe logprob bitwise mismatch "
+                        f"(abs diff={abs(a - b):.3e})."
+                    )

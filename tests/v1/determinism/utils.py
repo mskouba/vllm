@@ -131,5 +131,22 @@ def _extract_step_logprobs(request_output):
     return None, None
 
 
+def long_probe_prompt(num_words: int = 6000) -> str:
+    """Deterministic long prompt whose continuation is the invariance probe.
+
+    Length is load-bearing: short prompts stay reproducible even on a
+    non-invariant config, so a short needle hides the drift these tests hunt
+    for. The prompt is long enough to be split into several prefill chunks
+    under a small ``max_num_batched_tokens`` budget.
+    """
+    words = (
+        "market revenue guidance segment margin pipeline capacity demand "
+        "headwind backlog utilization cadence inventory logistics currency "
+        "hedging throughput latency variance gradient reduction accumulate"
+    ).split()
+    body = " ".join(words[i % len(words)] for i in range(num_words))
+    return "Summarize this in detail, listing every theme you find.\n\n" + body
+
+
 def is_device_capability_below_90() -> bool:
     return not current_platform.has_device_capability(90)
