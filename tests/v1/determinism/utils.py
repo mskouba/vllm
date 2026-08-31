@@ -131,21 +131,50 @@ def _extract_step_logprobs(request_output):
     return None, None
 
 
-def long_probe_prompt(num_words: int = 6000) -> str:
+# Fixed vocabulary from PR #51287's repro script, kept verbatim so these tests
+# reproduce that experiment rather than an approximation of it.
+_PROBE_WORDS = [
+    "market",
+    "revenue",
+    "guidance",
+    "segment",
+    "margin",
+    "pipeline",
+    "capacity",
+    "demand",
+    "headwind",
+    "backlog",
+    "utilization",
+    "cadence",
+    "inventory",
+    "logistics",
+    "currency",
+    "hedging",
+]
+
+
+def probe_text(num_words: int, shift: int = 0) -> str:
+    """Deterministic body of ``num_words`` drawn cyclically from a fixed vocab.
+
+    ``shift`` offsets the starting word so co-resident fillers differ from each
+    other. Mirrors the ``text(n, shift)`` helper in PR #51287's repro.
+    """
+    n = len(_PROBE_WORDS)
+    return " ".join(_PROBE_WORDS[(i + shift) % n] for i in range(num_words))
+
+
+def long_probe_prompt(num_words: int = 9000) -> str:
     """Deterministic long prompt whose continuation is the invariance probe.
 
     Length is load-bearing: short prompts stay reproducible even on a
     non-invariant config, so a short needle hides the drift these tests hunt
     for. The prompt is long enough to be split into several prefill chunks
-    under a small ``max_num_batched_tokens`` budget.
+    under a small ``max_num_batched_tokens`` budget. The 9000-word default
+    matches PR #51287's probe.
     """
-    words = (
-        "market revenue guidance segment margin pipeline capacity demand "
-        "headwind backlog utilization cadence inventory logistics currency "
-        "hedging throughput latency variance gradient reduction accumulate"
-    ).split()
-    body = " ".join(words[i % len(words)] for i in range(num_words))
-    return "Summarize this in detail, listing every theme you find.\n\n" + body
+    return "Summarize this in detail, listing every theme you find.\n\n" + probe_text(
+        num_words
+    )
 
 
 def is_device_capability_below_90() -> bool:

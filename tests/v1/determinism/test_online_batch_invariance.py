@@ -11,6 +11,7 @@ Environment variables:
 """
 
 import concurrent.futures as cf
+import hashlib
 import os
 import random
 import sys
@@ -23,6 +24,7 @@ from utils import (
     TEST_MODEL,
     _random_prompt,
     long_probe_prompt,
+    probe_text,
     skip_if_not_cuda,
 )
 
@@ -175,111 +177,113 @@ def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
         )
 
 
-def _filler_prompt(idx: int, num_words: int = 2000) -> str:
-    words = (
-        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu "
-        "nu xi omicron pi rho sigma tau upsilon phi chi psi omega"
-    ).split()
-    body = " ".join(words[(i + idx) % len(words)] for i in range(num_words))
-    return f"Request {idx}. Continue this list of terms:\n\n" + body
+def _int_list(csv: str) -> list[int]:
+    return [int(x) for x in csv.split(",") if x.strip()]
+
+
+def _chat_answer(
+    client: openai.OpenAI,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    max_retries: int = 3,
+    retry_backoff: float = 0.5,
+) -> str:
+    """One temperature-0 chat turn, returning reasoning + content concatenated.
+
+    Matches PR #51287's ``answer()``: reasoning models emit their chain in
+    ``reasoning_content``, so hashing content alone would miss drift there.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=max_tokens,
+            )
+            msg = resp.choices[0].message
+            reasoning = getattr(msg, "reasoning_content", "") or ""
+            return reasoning + (msg.content or "")
+        except Exception as e:  # pragma: no cover
+            if attempt < max_retries:
+                import time as _t
+
+                _t.sleep(retry_backoff * (2**attempt))
+                continue
+            raise AssertionError(f"chat request failed after retries: {e}") from e
+    raise AssertionError("unreachable")
+
+
+def _probe_hash(
+    client: openai.OpenAI,
+    model: str,
+    probe: str,
+    probe_max_tokens: int,
+    batch: int,
+) -> str:
+    """Hash the probe's output when co-resident with ``batch - 1`` fillers.
+
+    The probe is job 0; fillers use *staggered* ``max_tokens`` so they retire at
+    different decode steps, churning batch composition while the probe is still
+    generating. Mirrors ``probe_hash()`` in PR #51287's repro.
+    """
+    jobs: list[tuple[str, int]] = [(probe, probe_max_tokens)]
+    for i in range(batch - 1):
+        jobs.append((probe_text(3000, i), 400 + (i % 8) * 150))
+
+    with cf.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        outputs = list(
+            pool.map(lambda j: _chat_answer(client, model, j[0], j[1]), jobs)
+        )
+    return hashlib.sha256(outputs[0].encode()).hexdigest()[:12]
 
 
 @skip_if_not_cuda
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_probe_invariance_under_async_scheduling_churn(backend: str) -> None:
-    """Probe stays bitwise-identical while batch composition churns mid-decode.
+    """Reproduce PR #51287's async-scheduling batch-invariance probe.
 
-    Unlike the bs1-vs-bsN test above, this keeps async scheduling ON (the
-    default) and fires concurrent fillers with *staggered* ``max_tokens`` so
-    fillers retire at different decode steps. Batch composition therefore keeps
-    changing while the long probe is still generating.
-
-    A complete batch-invariant configuration is expected to return the exact
-    same probe tokens and logprobs every round despite that churn. A single
-    residual composition-dependent reduction (an incompletely invariant kernel)
-    shows up here as a probe flip across rounds, even though the static
-    bs1-vs-bsN test above passes. See the discussion on PR #51287.
+    This mirrors that PR's end-to-end repro as closely as the pytest harness
+    allows: async scheduling stays ON (the path under test), a long 9000-word
+    probe generates at temperature 0 while co-resident fillers with *staggered*
+    ``max_tokens`` retire at different decode steps, so batch composition churns
+    while the probe is still generating. Across every batch size and repeat the
+    probe output must hash identically. A single residual composition-dependent
+    reduction shows up as more than one distinct hash for the same input, even
+    though the static bs1-vs-bsN test above passes. See PR #51287.
     """
-    num_rounds = int(os.getenv("VLLM_PROBE_ROUNDS", "3"))
-    num_fillers = int(os.getenv("VLLM_PROBE_FILLERS", "24"))
-    probe_max_tokens = int(os.getenv("VLLM_PROBE_MAX_TOKENS", "256"))
+    batches = _int_list(os.getenv("VLLM_PROBE_BATCHES", "1,5,10,50"))
+    repeats = int(os.getenv("VLLM_PROBE_ROUNDS", "3"))
+    probe_max_tokens = int(os.getenv("VLLM_PROBE_MAX_TOKENS", "600"))
 
-    probe = long_probe_prompt()
-    probe_sp: dict[str, Any] = {
-        "temperature": 0.0,
-        "max_tokens": probe_max_tokens,
-        "seed": 20240919,
-        "logprobs": 1,
-    }
+    probe = long_probe_prompt()  # 9000-word probe, matching the PR
 
     server_args: list[str] = [
         "--max-model-len=16384",
-        f"--max-num-seqs={num_fillers + 1}",
+        f"--max-num-seqs={max(batches)}",
         f"--attention-backend={backend}",
-        # The path under test. Async scheduling is on by default; pass it
-        # explicitly so this test still churns composition if the default flips.
+        # The path under test: async scheduling on (the default). Passed
+        # explicitly so composition still churns if the default ever flips.
         "--async-scheduling",
-        # Isolate kernel numerics from cache-reuse effects.
+        # Isolate kernel numerics from cache-reuse effects (matches the PR).
         "--no-enable-prefix-caching",
     ]
+    tp_size = os.getenv("VLLM_TP_SIZE")
+    if tp_size:
+        server_args += ["-tp", tp_size]
 
-    baseline_tokens: list[Any] | None = None
-    baseline_logprobs: list[float] | None = None
-
+    hashes: dict[str, list[str]] = {}
     with RemoteOpenAIServer(TEST_MODEL, server_args) as server:
         client = server.get_client()
+        for rep in range(repeats):
+            for batch in batches:
+                h = _probe_hash(client, TEST_MODEL, probe, probe_max_tokens, batch)
+                hashes.setdefault(h, []).append(f"rep{rep} batch{batch}")
 
-        for rnd in range(num_rounds):
-            jobs: list[tuple[str, dict[str, Any]]] = [(probe, probe_sp)]
-            for i in range(num_fillers):
-                jobs.append(
-                    (
-                        _filler_prompt(i),
-                        {
-                            "temperature": 0.0,
-                            # Staggered retirement: fillers stop at different
-                            # decode steps, so composition churns under the probe.
-                            "max_tokens": 64 + (i % 8) * 24,
-                            "seed": 1234 + i,
-                        },
-                    )
-                )
-
-            with cf.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-                results = list(
-                    pool.map(
-                        lambda j: _request_completion(
-                            client, TEST_MODEL, j[0], j[1]
-                        ),
-                        jobs,
-                    )
-                )
-
-            probe_resp = results[0]
-            if probe_resp is None or not probe_resp.get("choices"):
-                raise AssertionError(f"Round {rnd}: probe request failed")
-            tokens, logprobs = _extract_tokens_and_logprobs(probe_resp["choices"][0])
-            if logprobs is None:
-                raise AssertionError(
-                    "logprobs not returned; ensure server supports 'logprobs'"
-                )
-
-            if baseline_tokens is None:
-                baseline_tokens = tokens
-                baseline_logprobs = logprobs
-                continue
-
-            if tokens != baseline_tokens:
-                raise AssertionError(
-                    f"Round {rnd}: probe token divergence under async-scheduling "
-                    f"composition churn.\n"
-                    f"baseline={baseline_tokens}\n"
-                    f"got     ={tokens}"
-                )
-            assert baseline_logprobs is not None
-            for t, (a, b) in enumerate(zip(baseline_logprobs, logprobs)):
-                if a != b:
-                    raise AssertionError(
-                        f"Round {rnd} step {t}: probe logprob bitwise mismatch "
-                        f"(abs diff={abs(a - b):.3e})."
-                    )
+    if len(hashes) != 1:
+        detail = "\n".join(f"  {h}: {', '.join(v)}" for h, v in hashes.items())
+        raise AssertionError(
+            "Probe not batch-invariant under async scheduling: "
+            f"{len(hashes)} distinct outputs for one input.\n{detail}"
+        )
